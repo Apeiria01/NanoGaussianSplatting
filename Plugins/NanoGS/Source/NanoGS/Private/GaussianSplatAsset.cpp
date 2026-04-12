@@ -441,7 +441,7 @@ void UGaussianSplatAsset::CreateColorTextureFromData()
 	ColorTexture->AddressY = TA_Clamp;
 	ColorTexture->NeverStream = true;
 	ColorTexture->LODGroup = TEXTUREGROUP_Pixels2D;
-	ColorTexture->MipGenSettings = TMGS_NoMipmaps;
+	//ColorTexture->MipGenSettings = TMGS_NoMipmaps;
 
 	// Create mip 0
 	FTexture2DMipMap* Mip = new FTexture2DMipMap();

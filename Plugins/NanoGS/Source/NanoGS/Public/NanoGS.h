@@ -50,4 +50,9 @@ private:
 
 	/** Render callback */
 	void OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters& Parameters);
+
+	/** Pre-loaded handle for sibr_cudaueinterop_rwdi.dll. Kept alive so the
+	 *  delay-load helper resolves symbols against an already-loaded module
+	 *  instead of triggering a search for transitive SIBR dependencies. */
+	void* SibrBridgeDllHandle = nullptr;
 };

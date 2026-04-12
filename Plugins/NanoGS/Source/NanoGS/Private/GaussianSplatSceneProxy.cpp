@@ -69,8 +69,14 @@ void FGaussianSplatGPUResources::InitRHI(FRHICommandListBase& RHICmdList)
 	SharedData->CreateGPUBuffers(RHICmdList);
 
 	// Copy shared GPU buffer refs (just ref-count increments, no GPU allocation)
-	PackedSplatBuffer = SharedData->PackedSplatBuffer;
-	PackedSplatBufferSRV = SharedData->PackedSplatBufferSRV;
+	PositionBuffer = SharedData->PositionBuffer;
+	PositionBufferSRV = SharedData->PositionBufferSRV;
+	RotationBuffer = SharedData->RotationBuffer;
+	RotationBufferSRV = SharedData->RotationBufferSRV;
+	ScaleBuffer = SharedData->ScaleBuffer;
+	ScaleBufferSRV = SharedData->ScaleBufferSRV;
+	ColorOpacityBuffer = SharedData->ColorOpacityBuffer;
+	ColorOpacityBufferSRV = SharedData->ColorOpacityBufferSRV;
 	SHBuffer = SharedData->SHBuffer;
 	SHBufferSRV = SharedData->SHBufferSRV;
 	ChunkBuffer = SharedData->ChunkBuffer;
@@ -101,8 +107,14 @@ void FGaussianSplatGPUResources::ReleaseRHI()
 {
 	// Release shared buffer refs (just ref-count decrements, actual GPU memory
 	// is freed when SharedData releases its refs)
-	PackedSplatBuffer.SafeRelease();
-	PackedSplatBufferSRV.SafeRelease();
+	PositionBuffer.SafeRelease();
+	PositionBufferSRV.SafeRelease();
+	RotationBuffer.SafeRelease();
+	RotationBufferSRV.SafeRelease();
+	ScaleBuffer.SafeRelease();
+	ScaleBufferSRV.SafeRelease();
+	ColorOpacityBuffer.SafeRelease();
+	ColorOpacityBufferSRV.SafeRelease();
 	SHBuffer.SafeRelease();
 	SHBufferSRV.SafeRelease();
 	ChunkBuffer.SafeRelease();
@@ -112,12 +124,6 @@ void FGaussianSplatGPUResources::ReleaseRHI()
 	ClusterBufferSRV.SafeRelease();
 	SplatClusterIndexBuffer.SafeRelease();
 	SplatClusterIndexBufferSRV.SafeRelease();
-
-	// Release legacy buffers
-	PositionBuffer.SafeRelease();
-	PositionBufferSRV.SafeRelease();
-	OtherDataBuffer.SafeRelease();
-	OtherDataBufferSRV.SafeRelease();
 
 	// Release per-instance buffers
 	ViewDataBuffer.SafeRelease();

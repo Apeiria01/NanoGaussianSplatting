@@ -18,12 +18,14 @@
 		{
 			"Name": "NanoGS",
 			"Type": "Runtime",
-			"LoadingPhase": "PostConfigInit"
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [ "Win64", "Android" ]
 		},
 		{
 			"Name": "NanoGSEditor",
 			"Type": "Editor",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [ "Win64"]
 		}
 	]
 }

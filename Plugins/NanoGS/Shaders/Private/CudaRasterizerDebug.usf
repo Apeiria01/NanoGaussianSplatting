@@ -1,0 +1,65 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+//
+// Debug display for CUDA rasterizer output.
+//
+// Reads the CHW float output of sibr::UECudaRasterizerBridge::forward and
+// draws it as an RGB overlay into a sub-rect of SceneColor. The source
+// buffer layout is (3 x H x W) float, matching CudaRasterizer::Rasterizer::forward:
+//
+//   bytes[0                 .. 1*H*W*4) : R plane, row-major (y * W + x)
+//   bytes[1*H*W*4 .. 2*H*W*4)           : G plane
+//   bytes[2*H*W*4 .. 3*H*W*4)           : B plane
+//
+// The VS emits a standard full-screen triangle. The PS checks if the current
+// SV_POSITION lies inside DestRect (in absolute pixel coords of the current
+// viewport). Pixels outside the rect are discarded so SceneColor stays intact;
+// pixels inside sample the CUDA buffer and overwrite SceneColor with the RGB
+// read from the three planes.
+
+#include "/Engine/Public/Platform.ush"
+
+ByteAddressBuffer CudaColorBuffer;
+uint2             CudaExtent;    // (W, H) of the CUDA render
+float4            DestRect;      // (MinX, MinY, MaxX, MaxY) in viewport pixels
+float             Exposure;      // linear multiplier for the sampled color
+
+void MainVS(uint VertexId : SV_VertexID, out float4 OutPosition : SV_POSITION)
+{
+	// Classic 3-vertex fullscreen triangle.
+	float2 UV = float2((VertexId << 1) & 2, VertexId & 2);
+	OutPosition = float4(UV * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 MainPS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+	int2 PixelPos = int2(SvPosition.xy);
+
+	// Discard anything outside the debug window.
+	if (PixelPos.x < (int)DestRect.x || PixelPos.y < (int)DestRect.y ||
+		PixelPos.x >= (int)DestRect.z || PixelPos.y >= (int)DestRect.w)
+	{
+		discard;
+	}
+
+	// Normalize to [0,1] inside DestRect, then map to CUDA pixel coord.
+	float2 DestSize = DestRect.zw - DestRect.xy;
+	float2 LocalUV  = (float2(PixelPos) - DestRect.xy + 0.5) / DestSize;
+
+	int2 CudaPx = int2(LocalUV * float2(CudaExtent));
+	CudaPx = clamp(CudaPx, int2(0, 0), int2(CudaExtent) - int2(1, 1));
+
+	uint PixelIndex = uint(CudaPx.y) * CudaExtent.x + uint(CudaPx.x);
+	uint PlaneStride = CudaExtent.x * CudaExtent.y * 4u; // bytes per plane
+
+	uint RBits = CudaColorBuffer.Load(PixelIndex * 4u);
+	uint GBits = CudaColorBuffer.Load(PixelIndex * 4u + PlaneStride);
+	uint BBits = CudaColorBuffer.Load(PixelIndex * 4u + PlaneStride * 2u);
+
+	float3 Rgb = float3(asfloat(RBits), asfloat(GBits), asfloat(BBits));
+
+	// CudaRasterizer output is already in [0,1] linear-ish space for trained
+	// scenes; apply an adjustable exposure so dim debug outputs remain visible.
+	Rgb = max(Rgb, 0.0) * Exposure;
+
+	return float4(Rgb, 1.0);
+}

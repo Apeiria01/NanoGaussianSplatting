@@ -47,6 +47,19 @@ public:
 	/** Import quality level (currently unused - always uses Float32 positions for maximum accuracy) */
 	EGaussianQualityLevel QualityLevel = EGaussianQualityLevel::VeryHigh;
 
+	/** Importer choice when both NanoGS and the Niagara-based plugin claim the .ply extension. */
+	enum class EPlyImporterChoice : uint8
+	{
+		Ask,
+		NanoGS,
+		Niagara,
+	};
+
+	/** Remembered choice for the current editor session (reset on editor restart). */
+	static EPlyImporterChoice SessionChoice;
+	/** If true, do not pop the dialog again this session. */
+	static bool bRememberSessionChoice;
+
 private:
 	/**
 	 * Import a PLY file and create/update a Gaussian Splat asset

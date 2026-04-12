@@ -32,10 +32,13 @@ public:
 	void Initialize(UGaussianSplatAsset* Asset);
 
 	/** Check if resources are valid */
-	bool IsValid() const { return bInitialized && SplatCount > 0 && (PackedSplatBufferSRV.IsValid() || ColorTextureSRV.IsValid()); }
+	bool IsValid() const { return bInitialized && SplatCount > 0 && (PositionBufferSRV.IsValid() || ColorTextureSRV.IsValid()); }
 
 	/** Get number of splats */
 	int32 GetSplatCount() const { return SplatCount; }
+
+	/** Get shared render data (contains CUDA bridge state and shared buffers). */
+	FGaussianSplatRenderData* GetSharedRenderData() const { return SharedData.Get(); }
 
 	//~ Begin FRenderResource Interface
 	virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
@@ -43,17 +46,21 @@ public:
 	//~ End FRenderResource Interface
 
 public:
-	/** Packed splat data buffer (16 bytes/splat: RGBA + float16 pos + octahedral quat + log scale) */
-	FBufferRHIRef PackedSplatBuffer;
-	FShaderResourceViewRHIRef PackedSplatBufferSRV;
-
-	/** Position data buffer (legacy, unused when packed format is active) */
+	/** SoA position buffer (float3 per splat) */
 	FBufferRHIRef PositionBuffer;
 	FShaderResourceViewRHIRef PositionBufferSRV;
 
-	/** Rotation + Scale data buffer (legacy, unused when packed format is active) */
-	FBufferRHIRef OtherDataBuffer;
-	FShaderResourceViewRHIRef OtherDataBufferSRV;
+	/** SoA rotation buffer (float4 quaternion per splat) */
+	FBufferRHIRef RotationBuffer;
+	FShaderResourceViewRHIRef RotationBufferSRV;
+
+	/** SoA scale buffer (float3 per splat) */
+	FBufferRHIRef ScaleBuffer;
+	FShaderResourceViewRHIRef ScaleBufferSRV;
+
+	/** SoA color/opacity buffer (packed RGBA8 per splat) */
+	FBufferRHIRef ColorOpacityBuffer;
+	FShaderResourceViewRHIRef ColorOpacityBufferSRV;
 
 	/** Spherical harmonics buffer */
 	FBufferRHIRef SHBuffer;

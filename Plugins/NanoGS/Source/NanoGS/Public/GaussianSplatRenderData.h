@@ -7,8 +7,12 @@
 #include "GaussianClusterTypes.h"
 #include "RHI.h"
 #include "RHIResources.h"
+#if PLATFORM_WINDOWS
+#include "UECudaRasterizerBridge.hpp"
+#endif
 
 class UGaussianSplatAsset;
+class FSceneView;
 
 /**
  * Shared render data for a Gaussian Splat asset.
@@ -31,6 +35,9 @@ public:
 	/** Release shared GPU buffers. */
 	void ReleaseGPUBuffers();
 
+	/** Render with CUDA rasterizer bridge using shared D3D12 buffers. Must run on render thread. */
+	bool ForwardWithCudaRasterizer(FRHICommandListBase& RHICmdList, const FSceneView& SceneView, int32 Width, int32 Height);
+
 	/** Whether CPU-side data has been initialized */
 	bool IsInitialized() const { return bIsInitialized; }
 
@@ -43,9 +50,29 @@ public:
 public:
 	// ---- Shared GPU buffers (created once, shared across all proxies) ----
 
-	/** Packed splat data buffer (16 bytes/splat) */
-	FBufferRHIRef PackedSplatBuffer;
-	FShaderResourceViewRHIRef PackedSplatBufferSRV;
+	/** SoA position buffer (float3 per splat) */
+	FBufferRHIRef PositionBuffer;
+	FShaderResourceViewRHIRef PositionBufferSRV;
+
+	/** SoA rotation buffer (float4 quaternion per splat) */
+	FBufferRHIRef RotationBuffer;
+	FShaderResourceViewRHIRef RotationBufferSRV;
+
+	/** SoA scale buffer (float3 per splat) */
+	FBufferRHIRef ScaleBuffer;
+	FShaderResourceViewRHIRef ScaleBufferSRV;
+
+	/** SoA color/opacity buffer (packed RGBA8 per splat) */
+	FBufferRHIRef ColorOpacityBuffer;
+	FShaderResourceViewRHIRef ColorOpacityBufferSRV;
+
+	/** SoA color buffer for CUDA rasterizer (float3 per splat) */
+	FBufferRHIRef ColorPrecompBuffer;
+	FShaderResourceViewRHIRef ColorPrecompBufferSRV;
+
+	/** SoA opacity buffer for CUDA rasterizer (float per splat) */
+	FBufferRHIRef OpacityFloatBuffer;
+	FShaderResourceViewRHIRef OpacityFloatBufferSRV;
 
 	/** Spherical harmonics buffer */
 	FBufferRHIRef SHBuffer;
@@ -80,12 +107,32 @@ public:
 
 private:
 	// ---- CPU-side cached data (freed after GPU upload) ----
-
-	TArray<uint8> PackedSplatData;
+#if PLATFORM_WINDOWS
+	sibr::UECudaRasterizerBridge* CudaRasterizerBridge;
+#endif
+	TArray<float> PositionDataSOA;
+	TArray<float> RotationDataSOA;
+	TArray<float> ScaleDataSOA;
+	TArray<uint32> ColorOpacityDataSOA;
+	TArray<float> ColorPrecompDataSOA;
+	TArray<float> OpacityDataSOA;
 	TArray<uint8> SHData;
 	TArray<FGaussianChunkInfo> CachedChunkData;
 	TArray<FGaussianGPUCluster> CachedClusterData;
 	TArray<uint32> CachedSplatClusterIndices;
+
+public:
+	/** Output color buffer written by the CUDA rasterizer (CHW float layout:
+	 *  3 planes of Width*Height floats each). Exposed publicly so the debug
+	 *  overlay pass in NanoGS.cpp can read it via CudaOutColorBufferSRV. */
+	FBufferRHIRef CudaOutColorBuffer;
+	FShaderResourceViewRHIRef CudaOutColorBufferSRV;
+	uint32 CudaOutColorBufferWidth = 0;
+	uint32 CudaOutColorBufferHeight = 0;
+
+private:
+	FBufferRHIRef CudaBackgroundBuffer;
+	uint32 CudaOutColorBufferBytes = 0;
 
 	bool bIsInitialized = false;
 	bool bGPUBuffersCreated = false;

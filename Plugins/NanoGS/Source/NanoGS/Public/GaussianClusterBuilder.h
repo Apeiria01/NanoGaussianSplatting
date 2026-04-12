@@ -39,7 +39,7 @@ public:
 		/** LOD reduction ratio - how many original splats per LOD splat (default: divide by 4) */
 		int32 LODReductionRatio = 4;
 
-		FBuildSettings() = default;
+		FBuildSettings() {}
 	};
 
 	/**

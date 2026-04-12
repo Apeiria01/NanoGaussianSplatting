@@ -133,7 +133,10 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
 	Parameters.SHBuffer = GPUResources->SHBufferSRV;
 	Parameters.ViewDataBuffer = GPUResources->ViewDataBufferUAV;
 
@@ -781,7 +784,10 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
 	Parameters.SHBuffer = GPUResources->SHBufferSRV;
 	Parameters.ViewDataBuffer = GPUResources->ViewDataBufferUAV;
 
@@ -915,7 +921,10 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
 	Parameters.SHBuffer = GPUResources->SHBufferSRV;
 
 	// Write into the GLOBAL buffer at GlobalBaseOffset
@@ -1186,37 +1195,43 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 		return;
 	}
 
-	// Transition global ViewData for graphics reads
-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::SRVGraphics));
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal_TransitionViewData);
+		// Transition global ViewData for graphics reads
+		RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::SRVGraphics));
+	}
 
-	FGraphicsPipelineStateInitializer GraphicsPSOInit;
-	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal_SetupPSO);
+		FGraphicsPipelineStateInitializer GraphicsPSOInit;
+		RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
 
-	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-	// Enable depth writes for TSR/TAA - splats write depth at their center position
-	// Using DepthNearOrEqual allows splats at similar depths to all blend correctly
-	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
-	// reduces temporal history weight for splat pixels, preventing ghost trails
-	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
-		true, CF_DepthNearOrEqual,                       // Depth: write + near/equal test
-		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Front stencil: replace on pass
-		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
-		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
-	>::GetRHI();
-	// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
-	// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
-	GraphicsPSOInit.BlendState = TStaticBlendState<
-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
-	>::GetRHI();
-	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
-	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
-	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
-	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+		GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+		// Enable depth writes for TSR/TAA - splats write depth at their center position
+		// Using DepthNearOrEqual allows splats at similar depths to all blend correctly
+		// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
+		// reduces temporal history weight for splat pixels, preventing ghost trails
+		GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
+			true, CF_DepthNearOrEqual,                       // Depth: write + near/equal test
+			true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Front stencil: replace on pass
+			false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
+			0x08, 0x08                                       // Read mask, Write mask = bit 3 only
+		>::GetRHI();
+		// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
+		// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
+			// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+			CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
+		>::GetRHI();
+		GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+		GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+		GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+		GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
 
-	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+		SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+	}
 
 	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
 	FIntRect ViewRect = ViewInfo.ViewRect;
@@ -1225,29 +1240,35 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
 	);
 
-	FGaussianSplatVS::FParameters VSParameters;
-	VSParameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferSRV;
-	VSParameters.SortKeysBuffer = GlobalAccumulator->GlobalSortKeysBufferSRV;
-	VSParameters.SplatCount = TotalSplatCount;
-	VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, DebugMode));
-	VSParameters.EnableNanite = 1;
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal_SetShaderParams);
+		FGaussianSplatVS::FParameters VSParameters;
+		VSParameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferSRV;
+		VSParameters.SortKeysBuffer = GlobalAccumulator->GlobalSortKeysBufferSRV;
+		VSParameters.SplatCount = TotalSplatCount;
+		VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, DebugMode));
+		VSParameters.EnableNanite = 1;
 
-	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+		SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
 
-	FGaussianSplatPS::FParameters PSParameters;
-	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
-	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+		FGaussianSplatPS::FParameters PSParameters;
+		SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+		SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+	}
 
-	RHICmdList.SetStreamSource(0, nullptr, 0);
-	RHICmdList.DrawIndexedPrimitive(
-		IndexBuffer,
-		0,              // BaseVertexIndex
-		0,              // FirstInstance
-		4,              // NumVertices
-		0,              // StartIndex
-		2,              // NumPrimitives (2 triangles per quad)
-		TotalSplatCount // NumInstances
-	);
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal_DrawIndexedPrimitive);
+		RHICmdList.SetStreamSource(0, nullptr, 0);
+		RHICmdList.DrawIndexedPrimitive(
+			IndexBuffer,
+			0,              // BaseVertexIndex
+			0,              // FirstInstance
+			4,              // NumVertices
+			0,              // StartIndex
+			2,              // NumPrimitives (2 triangles per quad)
+			TotalSplatCount // NumInstances
+		);
+	}
 }
 
 //----------------------------------------------------------------------
@@ -1366,7 +1387,10 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
 	Parameters.SHBuffer = GPUResources->SHBufferSRV;
 
 	// Write into GLOBAL buffer
@@ -1620,37 +1644,43 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 		return;
 	}
 
-	// Transition global ViewData for graphics reads (SortKeysBuffer already in SRVGraphics)
-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::SRVGraphics));
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect_TransitionViewData);
+		// Transition global ViewData for graphics reads (SortKeysBuffer already in SRVGraphics)
+		RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::SRVGraphics));
+	}
 
-	FGraphicsPipelineStateInitializer GraphicsPSOInit;
-	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect_SetupPSO);
+		FGraphicsPipelineStateInitializer GraphicsPSOInit;
+		RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
 
-	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-	// Enable depth writes for TSR/TAA - splats write depth at their center position
-	// Using DepthNearOrEqual allows splats at similar depths to all blend correctly
-	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
-	// reduces temporal history weight for splat pixels, preventing ghost trails
-	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
-		true, CF_DepthNearOrEqual,                       // Depth: write + near/equal test
-		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Front stencil: replace on pass
-		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
-		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
-	>::GetRHI();
-	// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
-	// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
-	GraphicsPSOInit.BlendState = TStaticBlendState<
-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
-	>::GetRHI();
-	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
-	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
-	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
-	GraphicsPSOInit.BoundShaderState.PixelShaderRHI  = PixelShader.GetPixelShader();
+		GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+		// Enable depth writes for TSR/TAA - splats write depth at their center position
+		// Using DepthNearOrEqual allows splats at similar depths to all blend correctly
+		// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
+		// reduces temporal history weight for splat pixels, preventing ghost trails
+		GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
+			true, CF_DepthNearOrEqual,                       // Depth: write + near/equal test
+			true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Front stencil: replace on pass
+			false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
+			0x08, 0x08                                       // Read mask, Write mask = bit 3 only
+		>::GetRHI();
+		// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
+		// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
+			// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+			CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
+		>::GetRHI();
+		GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+		GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+		GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+		GraphicsPSOInit.BoundShaderState.PixelShaderRHI  = PixelShader.GetPixelShader();
 
-	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+		SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+	}
 
 	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
 	FIntRect ViewRect = ViewInfo.ViewRect;
@@ -1659,27 +1689,33 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
 	);
 
-	// GlobalDrawIndirectArgsBuffer is in IndirectArgs state from DispatchPrefixSumVisibleCounts
-	// (or retained from previous frame when bCanSkip is true)
-	FGaussianSplatVS::FParameters VSParameters;
-	VSParameters.ViewDataBuffer  = GlobalAccumulator->GlobalViewDataBufferSRV;
-	VSParameters.SortKeysBuffer  = GlobalAccumulator->GlobalSortKeysBufferSRV;
-	VSParameters.SplatCount      = GlobalAccumulator->AllocatedCount;  // Upper bound for VS guard
-	VSParameters.DebugMode       = static_cast<uint32>(FMath::Max(0, DebugMode));
-	VSParameters.EnableNanite    = 1;
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect_SetShaderParams);
+		// GlobalDrawIndirectArgsBuffer is in IndirectArgs state from DispatchPrefixSumVisibleCounts
+		// (or retained from previous frame when bCanSkip is true)
+		FGaussianSplatVS::FParameters VSParameters;
+		VSParameters.ViewDataBuffer  = GlobalAccumulator->GlobalViewDataBufferSRV;
+		VSParameters.SortKeysBuffer  = GlobalAccumulator->GlobalSortKeysBufferSRV;
+		VSParameters.SplatCount      = GlobalAccumulator->AllocatedCount;  // Upper bound for VS guard
+		VSParameters.DebugMode       = static_cast<uint32>(FMath::Max(0, DebugMode));
+		VSParameters.EnableNanite    = 1;
 
-	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+		SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
 
-	FGaussianSplatPS::FParameters PSParameters;
-	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
-	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+		FGaussianSplatPS::FParameters PSParameters;
+		SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+		SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+	}
 
-	RHICmdList.SetStreamSource(0, nullptr, 0);
-	RHICmdList.DrawIndexedPrimitiveIndirect(
-		IndexBuffer,
-		GlobalAccumulator->GlobalDrawIndirectArgsBuffer,
-		0  // ArgumentOffset
-	);
+	{
+		SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect_DrawIndexedPrimitiveIndirect);
+		RHICmdList.SetStreamSource(0, nullptr, 0);
+		RHICmdList.DrawIndexedPrimitiveIndirect(
+			IndexBuffer,
+			GlobalAccumulator->GlobalDrawIndirectArgsBuffer,
+			0  // ArgumentOffset
+		);
+	}
 }
 
 void FGaussianSplatRenderer::ExtractFrustumPlanes(const FMatrix& ViewProjection, FVector4f OutPlanes[6])
@@ -1908,6 +1944,60 @@ int32 FGaussianSplatRenderer::DispatchClusterCulling(
 	// Return leaf cluster count as placeholder (actual count would require GPU readback)
 	// In a real implementation, you'd use the VisibleClusterBuffer in subsequent passes
 	return GPUResources->LeafClusterCount;
+}
+
+void FGaussianSplatRenderer::BlitCudaOutColorDebug(
+	FRHICommandListImmediate& RHICmdList,
+	const FSceneView& View,
+	FShaderResourceViewRHIRef CudaColorSRV,
+	FUintVector2 CudaExtent,
+	FVector4f DestRect,
+	float Exposure)
+{
+	if (!CudaColorSRV.IsValid() || CudaExtent.X == 0 || CudaExtent.Y == 0)
+	{
+		return;
+	}
+
+	SCOPED_DRAW_EVENT(RHICmdList, CudaRasterizerDebugOverlay);
+
+	TShaderMapRef<FCudaRasterizerDebugVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FCudaRasterizerDebugPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+	{
+		return;
+	}
+
+	FGraphicsPipelineStateInitializer GraphicsPSOInit;
+	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+
+	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+	// Opaque overwrite — the PS discards outside DestRect, so SceneColor under
+	// the rest of the screen is preserved.
+	GraphicsPSOInit.BlendState = TStaticBlendState<CW_RGB>::GetRHI();
+	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+	GraphicsPSOInit.BoundShaderState.PixelShaderRHI  = PixelShader.GetPixelShader();
+
+	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	const FIntRect ViewRect = ViewInfo.ViewRect;
+	RHICmdList.SetViewport(
+		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
+		ViewRect.Max.X, ViewRect.Max.Y, 1.0f);
+
+	FCudaRasterizerDebugPS::FParameters PSParameters;
+	PSParameters.CudaColorBuffer = CudaColorSRV;
+	PSParameters.CudaExtent      = CudaExtent;
+	PSParameters.DestRect        = DestRect;
+	PSParameters.Exposure        = Exposure;
+	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+
+	RHICmdList.SetStreamSource(0, nullptr, 0);
+	RHICmdList.DrawPrimitive(0, 1, 1);
 }
 
 void FGaussianSplatRenderer::CompositeToSceneColor(

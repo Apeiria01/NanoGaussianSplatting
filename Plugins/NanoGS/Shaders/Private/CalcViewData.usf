@@ -5,8 +5,11 @@
 #include "/Plugin/NanoGS/Private/GaussianSplatting.ush"
 
 // Shader parameters
-ByteAddressBuffer PackedSplatBuffer;  // 16 bytes/splat packed data
-ByteAddressBuffer SHBuffer;           // SH data (currently unused)
+ByteAddressBuffer PositionBuffer;      // 12 bytes/splat (float3)
+ByteAddressBuffer RotationBuffer;      // 16 bytes/splat (float4 quaternion)
+ByteAddressBuffer ScaleBuffer;         // 12 bytes/splat (float3)
+ByteAddressBuffer ColorOpacityBuffer;  // 4 bytes/splat (packed RGBA8)
+ByteAddressBuffer SHBuffer;            // SH data
 RWStructuredBuffer<FGaussianSplatViewData> ViewDataBuffer; //pass calculated result to ViewDataBuffer
 
 // Cluster visibility integration (UNIFIED APPROACH)
@@ -84,13 +87,16 @@ void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
 // Core: transform a single splat to screen space and write to ViewDataBuffer
 void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uint selectedLODLevel)
 {
-	// Unpack splat data from packed buffer
-	FUnpackedSplat splat = UnpackSplat(PackedSplatBuffer, splatIndex);
-
-	float3 localPos = splat.Position;
-	float4 rotation = splat.Rotation;
-	float3 scale = splat.Scale * SplatScale;
-	float4 colorOpacity = splat.ColorOpacity;
+	// Load SoA point attributes
+	float3 localPos = asfloat(PositionBuffer.Load3(splatIndex * 12));
+	float4 rotation = asfloat(RotationBuffer.Load4(splatIndex * 16));
+	float3 scale = asfloat(ScaleBuffer.Load3(splatIndex * 12)) * SplatScale;
+	uint packedColorOpacity = ColorOpacityBuffer.Load(splatIndex * 4);
+	float4 colorOpacity;
+	colorOpacity.r = (packedColorOpacity & 0xFF) / 255.0;
+	colorOpacity.g = ((packedColorOpacity >> 8) & 0xFF) / 255.0;
+	colorOpacity.b = ((packedColorOpacity >> 16) & 0xFF) / 255.0;
+	colorOpacity.a = ((packedColorOpacity >> 24) & 0xFF) / 255.0;
 	float opacity = colorOpacity.a * OpacityScale;
 
 	// Transform to world space

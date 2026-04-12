@@ -11,6 +11,8 @@ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatVS, "/Plugin/NanoGS/Private/GaussianSplatR
 IMPLEMENT_GLOBAL_SHADER(FGaussianSplatPS, "/Plugin/NanoGS/Private/GaussianSplatRendering.usf", "MainPS", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositeVS, "/Plugin/NanoGS/Private/GaussianSplatComposite.usf", "MainVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositePS, "/Plugin/NanoGS/Private/GaussianSplatComposite.usf", "MainPS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FCudaRasterizerDebugVS, "/Plugin/NanoGS/Private/CudaRasterizerDebug.usf", "MainVS", SF_Vertex);
+IMPLEMENT_GLOBAL_SHADER(FCudaRasterizerDebugPS, "/Plugin/NanoGS/Private/CudaRasterizerDebug.usf", "MainPS", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FRadixSortCountCS, "/Plugin/NanoGS/Private/RadixSort.usf", "CountCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FRadixSortPrefixSumCS, "/Plugin/NanoGS/Private/RadixSort.usf", "PrefixSumCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FRadixSortDigitPrefixSumCS, "/Plugin/NanoGS/Private/RadixSort.usf", "DigitPrefixSumCS", SF_Compute);

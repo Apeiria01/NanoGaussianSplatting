@@ -292,6 +292,28 @@ public:
 		FTextureRHIRef IntermediateTexture
 	);
 
+	/**
+	 * Debug overlay that samples the CHW float3 CUDA rasterizer output from
+	 * the given raw ByteAddressBuffer SRV and writes it into a sub-rect of the
+	 * currently-bound render target (SceneColor). Pixels outside DestRect are
+	 * left untouched.
+	 *
+	 * Must be called inside an RDG pass lambda that has SceneColor bound.
+	 *
+	 * @param CudaColorSRV       SRV over the raw FBuffer that CUDA wrote into
+	 * @param CudaExtent         (Width, Height) of the CUDA render
+	 * @param DestRect           (MinX, MinY, MaxX, MaxY) in viewport-space pixels
+	 * @param Exposure           Linear multiplier applied to the sampled color
+	 */
+	static void BlitCudaOutColorDebug(
+		FRHICommandListImmediate& RHICmdList,
+		const FSceneView& View,
+		FShaderResourceViewRHIRef CudaColorSRV,
+		FUintVector2 CudaExtent,
+		FVector4f DestRect,
+		float Exposure
+	);
+
 private:
 	/** Calculate next power of 2 */
 	static uint32 NextPowerOfTwo(uint32 Value);

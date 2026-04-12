@@ -4,6 +4,7 @@
 #include "GaussianSplatViewExtension.h"
 #include "GaussianSplatRenderer.h"
 #include "GaussianSplatSceneProxy.h"
+#include "GaussianSplatRenderData.h"
 #include "GaussianGlobalAccumulator.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
@@ -11,12 +12,19 @@
 #include "SceneViewExtension.h"
 #include "Misc/CoreDelegates.h"
 #include "Engine/Engine.h"
+#if PLATFORM_WINDOWS
+#include "CudaModule.h"
+#endif
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "SceneView.h"
 #include "ScreenPass.h"
 
 #define LOCTEXT_NAMESPACE "FNanoGSModule"
+
+// Compute pass parameter struct: no render target slots (compute dispatches must be outside Vulkan render pass)
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianComputePhaseParameters, )
+END_SHADER_PARAMETER_STRUCT()
 
 // Pass 2 parameter struct: declares IntermediateTexture as an RDG-tracked shader resource
 // so that RDG inserts the proper RTV→SRV barrier between Pass 1 (write) and Pass 2 (read).
@@ -66,6 +74,32 @@ TAutoConsoleVariable<int32> CVarDebugForceLODLevel(
 	TEXT("Use with gs.ShowClusterBounds 2 to visualize which LOD level is being rendered."),
 	ECVF_RenderThreadSafe);
 
+/** Debug switch: run CUDA rasterizer bridge once per frame on the closest visible proxy. */
+TAutoConsoleVariable<int32> CVarUseCudaRasterizerBridge(
+	TEXT("gs.UseCudaRasterizerBridge"),
+	0,
+	TEXT("Enable UECudaRasterizerBridge::forward in post-opaque render pass.\n")
+	TEXT(" 0: Off (default)\n")
+	TEXT(" 1: On"),
+	ECVF_RenderThreadSafe);
+
+/** Debug display for the CUDA rasterizer output. Reads CudaOutColorBuffer and
+ *  writes it as an overlay on top of SceneColor. Requires gs.UseCudaRasterizerBridge=1. */
+TAutoConsoleVariable<int32> CVarShowCudaRasterizerDebug(
+	TEXT("gs.ShowCudaRasterizerDebug"),
+	0,
+	TEXT("Display CUDA rasterizer output (sibr::UECudaRasterizerBridge::forward result) on SceneColor.\n")
+	TEXT(" 0: Off (default)\n")
+	TEXT(" 1: Small overlay in bottom-right quadrant (~1/4 screen)\n")
+	TEXT(" 2: Full-screen replace"),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<float> CVarCudaRasterizerDebugExposure(
+	TEXT("gs.CudaRasterizerDebugExposure"),
+	1.0f,
+	TEXT("Linear exposure multiplier applied to the CUDA rasterizer debug overlay."),
+	ECVF_RenderThreadSafe);
+
 // Export for other modules
 int32 GGaussianSplatShowClusterBounds = 0;
 
@@ -77,6 +111,70 @@ static IRendererModule& GetRendererModuleRef()
 
 void FNanoGSModule::StartupModule()
 {
+	// CUDA must be loaded by the game thread before any render-thread code touches it.
+#if PLATFORM_WINDOWS
+	FCUDAModule& CudaModule = FModuleManager::LoadModuleChecked<FCUDAModule>("CUDA");
+	if (!CudaModule.IsAvailable())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("NanoGS: CUDA module loaded but CUDA driver API is unavailable."));
+	}
+#endif
+
+	// Pre-load sibr_cudaueinterop_rwdi.dll from the plugin's ThirdParty bin folder.
+	//
+	// The DLL is marked PublicDelayLoadDLLs in NanoGS.Build.cs, but it depends on a
+	// large set of sibling SIBR DLLs (sibr_basic_rwdi.dll, sibr_system_rwdi.dll,
+	// sibr_graphics_rwdi.dll, boost_filesystem*, glew32, embree3, tbb, opencv_*, ...)
+	// that are NOT copied to $(TargetOutputDir). When the delay-load helper first
+	// touches a symbol from the bridge DLL, the OS loader fails to find those
+	// transitive deps and the helper raises a fatal exception inside delayhlp.cpp.
+	//
+	// To fix this we push the SIBR bin folder onto the DLL search path *before*
+	// LoadLibrary, then load the bridge DLL explicitly. The OS resolves all
+	// transitive imports from the same directory while the search path is active.
+	// We keep SibrBridgeDllHandle alive for the lifetime of the module so the
+	// delay-load helper just hits an already-loaded module on first symbol use.
+	{
+		const TSharedPtr<IPlugin> NanoGSPlugin = IPluginManager::Get().FindPlugin(TEXT("NanoGS"));
+#if PLATFORM_WINDOWS
+		if (NanoGSPlugin.IsValid())
+		{
+			const FString SibrBinDir = FPaths::ConvertRelativePathToFull(
+				FPaths::Combine(NanoGSPlugin->GetBaseDir(),
+					TEXT("Source/ThirdParty/SibrCudaUEInterop/bin/Win64")));
+
+			const FString SibrBridgeDllPath = FPaths::Combine(SibrBinDir, TEXT("sibr_cudaueinterop_rwdi.dll"));
+
+			if (FPaths::FileExists(SibrBridgeDllPath))
+			{
+				FPlatformProcess::PushDllDirectory(*SibrBinDir);
+				SibrBridgeDllHandle = FPlatformProcess::GetDllHandle(*SibrBridgeDllPath);
+				FPlatformProcess::PopDllDirectory(*SibrBinDir);
+
+				if (SibrBridgeDllHandle == nullptr)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("NanoGS: Failed to pre-load sibr_cudaueinterop_rwdi.dll from '%s'. ")
+						TEXT("CUDA rasterizer bridge will not be available — calls into UECudaRasterizerBridge ")
+						TEXT("will trigger a delay-load fault. Verify that all SIBR sibling DLLs ")
+						TEXT("(sibr_basic_rwdi.dll, sibr_system_rwdi.dll, etc.) are present in that folder."),
+						*SibrBinDir);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Log, TEXT("NanoGS: Pre-loaded SIBR CUDA bridge DLL from '%s'."), *SibrBridgeDllPath);
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("NanoGS: sibr_cudaueinterop_rwdi.dll not found at '%s'. CUDA rasterizer bridge disabled."),
+					*SibrBridgeDllPath);
+			}
+		}
+#endif
+	}
+
 	// Register the shader directory so we can use our custom shaders
 	FString PluginShaderDir = FPaths::Combine(IPluginManager::Get().FindPlugin(TEXT("NanoGS"))->GetBaseDir(), TEXT("Shaders"));
 	AddShaderSourceDirectoryMapping(TEXT("/Plugin/NanoGS"), PluginShaderDir);
@@ -117,6 +215,14 @@ void FNanoGSModule::OnPostEngineInit()
 	}
 }
 
+// Shared state between compute and raster RDG passes (must be at namespace scope for GraphBuilder.Alloc)
+struct FGaussianComputePassResult
+{
+	bool bHasValidProxies = false;
+	bool bUseCompactionPath = false;
+	uint32 CappedTotalSplatCount = 0;
+};
+
 void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters& Parameters)
 {
 	FGaussianSplatViewExtension* Ext = FGaussianSplatViewExtension::Get();
@@ -155,8 +261,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	{
 		return;
 	}
+	const FIntPoint RenderExtent = ColorTexture->Desc.Extent;
 
 	int32 DebugMode = CVarShowClusterBounds.GetValueOnRenderThread();
+	const bool bUseCudaRasterizerBridge = (CVarUseCudaRasterizerBridge.GetValueOnRenderThread() != 0);
 
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
@@ -315,16 +423,21 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			MaxRenderBudget = 0;  // Unlimited — debug mode overrides budget
 		}
 
+		// Shared state between compute and raster passes (allocated from RDG arena)
+		FGaussianComputePassResult* ComputeResult = GraphBuilder.AllocObject<FGaussianComputePassResult>();
+
+		// ---- COMPUTE PASS: All compute shader dispatches (must be outside Vulkan render pass) ----
+		FGaussianComputePhaseParameters* ComputePassParams = GraphBuilder.AllocParameters<FGaussianComputePhaseParameters>();
 		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
-			Pass1Parameters,
-			ERDGPassFlags::Raster,
+			RDG_EVENT_NAME("GaussianSplat_ComputePhases"),
+			ComputePassParams,
+			ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, DebugMode, MaxRenderBudget](FRHICommandListImmediate& RHICmdList)
+			 CurrentDebugForceLODLevel, MaxRenderBudget, RenderExtent, bUseCudaRasterizerBridge, ComputeResult](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
-				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
+				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCompute_Global);
 
 				// SAFETY CHECK: Re-validate all proxies before rendering.
 				// Proxies may have been destroyed between when we built VisibleProxies
@@ -352,6 +465,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					return;
 				}
 
+				ComputeResult->bHasValidProxies = true;
+
 				// Invalidate cache skip if the proxy list changed (some proxies were destroyed)
 				// This ensures we don't use stale cached data when the scene has changed
 				bool bCanSkipAdjusted = bCanSkip;
@@ -366,6 +481,16 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				for (const auto& Info : ValidProxies)
 				{
 					Info.Proxy->TryInitializeColorTexture(RHICmdList);
+				}
+
+				if (bUseCudaRasterizerBridge && ValidProxies.Num() > 0)
+				{
+					FGaussianSplatGPUResources* FirstGPUResources = ValidProxies[0].Proxy->GetGPUResources();
+					FGaussianSplatRenderData* SharedRenderData = FirstGPUResources ? FirstGPUResources->GetSharedRenderData() : nullptr;
+					if (SharedRenderData)
+					{
+						SharedRenderData->ForwardWithCudaRasterizer(RHICmdList, *SceneView, RenderExtent.X, RenderExtent.Y);
+					}
 				}
 
 				// Ensure global buffers are large enough for all splats
@@ -524,9 +649,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						}
 					}
 
-					// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
-					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
-						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
+					// Store result for raster pass — draw call happens in raster pass below
+					ComputeResult->bUseCompactionPath = true;
 				}
 				else
 				{
@@ -608,10 +732,32 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						}
 					}
 
-					// Single draw call for ALL proxies (capped to render budget)
+					// Store result for raster pass
+					ComputeResult->CappedTotalSplatCount = CappedTotalSplatCount;
+				}
+			}
+		);
+
+		// ---- RASTER PASS: Draw calls only (inside Vulkan render pass) ----
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
+			Pass1Parameters,
+			ERDGPassFlags::Raster,
+			[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, ComputeResult](FRHICommandListImmediate& RHICmdList)
+			{
+				if (!SceneView || !ComputeResult->bHasValidProxies) return;
+				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
+
+				if (ComputeResult->bUseCompactionPath)
+				{
+					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
+						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
+				}
+				else
+				{
 					FGaussianSplatRenderer::DrawSplatsGlobal(
 						RHICmdList, *SceneView, RawAccumulator,
-						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode);
+						SharedIndexBuffer, (int32)ComputeResult->CappedTotalSplatCount, DebugMode);
 				}
 			}
 		);
@@ -627,11 +773,19 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		Pass2Parameters->IntermediateTexture = IntermediateTexture;
 		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
 
+		// CUDA rasterizer debug overlay settings, evaluated once at build time and
+		// captured by Pass2's execution lambda. Only active when the bridge itself
+		// is enabled — otherwise CudaOutColorBufferSRV will never be populated.
+		const int32 CudaDebugMode = CVarShowCudaRasterizerDebug.GetValueOnRenderThread();
+		const float CudaDebugExposure = CVarCudaRasterizerDebugExposure.GetValueOnRenderThread();
+		const bool bCudaDebugEnabled = bUseCudaRasterizerBridge && CudaDebugMode > 0 && Proxies.Num() > 0;
+
 		GraphBuilder.AddPass(
 			RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
 			Pass2Parameters,
 			ERDGPassFlags::Raster,
-			[SceneView, IntermediateTexture](FRHICommandListImmediate& RHICmdList)
+			[SceneView, IntermediateTexture, Proxies, RenderExtent, CudaDebugMode, CudaDebugExposure, bCudaDebugEnabled]
+			(FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 
@@ -640,6 +794,62 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 				FGaussianSplatRenderer::CompositeToSceneColor(
 					RHICmdList, *SceneView, IntermediateRHI);
+
+				if (!bCudaDebugEnabled)
+				{
+					return;
+				}
+
+				// Find the first valid proxy that has a populated CUDA output SRV.
+				// Pass1 only runs forward() on ValidProxies[0], so normally only
+				// the closest proxy has a live SRV — scan defensively in case the
+				// proxy set changed between Pass1 and Pass2 execution.
+				FGaussianSplatRenderData* DebugRenderData = nullptr;
+				for (FGaussianSplatSceneProxy* Proxy : Proxies)
+				{
+					if (!Proxy || !Proxy->IsValidForRendering()) continue;
+					FGaussianSplatGPUResources* GPUResources = Proxy->GetGPUResources();
+					if (!GPUResources) continue;
+					FGaussianSplatRenderData* SharedRenderData = GPUResources->GetSharedRenderData();
+					if (SharedRenderData && SharedRenderData->CudaOutColorBufferSRV.IsValid()
+						&& SharedRenderData->CudaOutColorBufferWidth > 0
+						&& SharedRenderData->CudaOutColorBufferHeight > 0)
+					{
+						DebugRenderData = SharedRenderData;
+						break;
+					}
+				}
+				if (!DebugRenderData) return;
+
+				// DestRect in viewport-space pixels (absolute). The PS uses these to
+				// decide per-pixel whether to sample the CUDA buffer or discard.
+				FVector4f DestRect;
+				if (CudaDebugMode >= 2)
+				{
+					// Full-screen replace
+					DestRect = FVector4f(0.0f, 0.0f,
+						static_cast<float>(RenderExtent.X),
+						static_cast<float>(RenderExtent.Y));
+				}
+				else
+				{
+					// Bottom-right quadrant, half width/half height
+					const float HalfW = static_cast<float>(RenderExtent.X) * 0.5f;
+					const float HalfH = static_cast<float>(RenderExtent.Y) * 0.5f;
+					DestRect = FVector4f(
+						static_cast<float>(RenderExtent.X) - HalfW,
+						static_cast<float>(RenderExtent.Y) - HalfH,
+						static_cast<float>(RenderExtent.X),
+						static_cast<float>(RenderExtent.Y));
+				}
+
+				FGaussianSplatRenderer::BlitCudaOutColorDebug(
+					RHICmdList,
+					*SceneView,
+					DebugRenderData->CudaOutColorBufferSRV,
+					FUintVector2(DebugRenderData->CudaOutColorBufferWidth, DebugRenderData->CudaOutColorBufferHeight),
+					DestRect,
+					CudaDebugExposure);
 			}
 		);
 }
@@ -674,6 +884,16 @@ void FNanoGSModule::ShutdownModule()
 
 	// Clear the view extension
 	ViewExtension.Reset();
+
+	// Free the pre-loaded SIBR bridge DLL handle. The render-thread bridge
+	// instance is owned by FGaussianSplatRenderData, which is destroyed before
+	// the module shuts down via the asset/proxy lifetime, so unloading here
+	// is safe.
+	if (SibrBridgeDllHandle != nullptr)
+	{
+		FPlatformProcess::FreeDllHandle(SibrBridgeDllHandle);
+		SibrBridgeDllHandle = nullptr;
+	}
 }
 
 FNanoGSModule& FNanoGSModule::Get()
