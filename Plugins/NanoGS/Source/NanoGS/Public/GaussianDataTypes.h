@@ -126,8 +126,8 @@ struct FGaussianSplatViewData
 	/** Translated world position for velocity calculation (world + PreViewTranslation) */
 	FVector3f TranslatedWorldPos = FVector3f::ZeroVector;
 
-	/** Padding after TranslatedWorldPos for alignment */
-	float TranslatedWorldPosPad = 0.0f;
+	/** OIT权重 (OIT模式下存储 φ²+φ/d²+exp(smax/d))，原始模式下为0 */
+	float OITWeight = 0.0f;
 
 	/** Half-float packed R,G channels */
 	uint32 PackedColorRG = 0;

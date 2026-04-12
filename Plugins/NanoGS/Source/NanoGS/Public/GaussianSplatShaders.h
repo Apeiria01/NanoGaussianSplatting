@@ -222,6 +222,186 @@ class FGaussianSplatPS : public FGlobalShader
 	}
 };
 
+//----------------------------------------------------------------------
+// OIT (Order-Independent Transparency) 渲染路径着色器
+// 基于Mobile-GS的加权平均OIT混合方案
+//----------------------------------------------------------------------
+
+/**
+ * MLP前向推理占位符CS
+ * 为每个高斯图元计算视角相关的phi和opacity
+ * 当前输出默认值，后续可替换为实际MLP推理
+ */
+class FMLPForwardCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FMLPForwardCS);
+	SHADER_USE_PARAMETER_STRUCT(FMLPForwardCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, PositionBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, ScaleBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, RotationBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, ColorOpacityBuffer)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<float2>, PhiOpacityBuffer) // 输出: [phi, opacity]
+		SHADER_PARAMETER(FVector3f, CameraPosition)
+		SHADER_PARAMETER(uint32, SplatCount)
+		SHADER_PARAMETER(float, OpacityScale)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 256);
+	}
+};
+
+/**
+ * OIT变体的CalcViewData CS
+ * 在原版基础上额外读取PhiOpacityBuffer，计算OIT权重
+ */
+class FGaussianSplatCalcViewDataOITCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGaussianSplatCalcViewDataOITCS);
+	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCalcViewDataOITCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		// 与CalcViewDataCS相同的参数
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, PositionBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, RotationBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, ScaleBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, ColorOpacityBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, SHBuffer)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<FGaussianSplatViewData>, ViewDataBuffer)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SplatClusterIndexBuffer)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, ClusterVisibilityBitmap)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, LODClusterSelectedBitmap)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SelectedClusterBuffer)
+		SHADER_PARAMETER(uint32, UseClusterCulling)
+		SHADER_PARAMETER(uint32, UseLODRendering)
+		SHADER_PARAMETER(uint32, OriginalSplatCount)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, CompactedSplatIndices)
+		SHADER_PARAMETER(uint32, UseCompaction)
+		SHADER_PARAMETER(uint32, VisibleSplatCount)
+		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
+		SHADER_PARAMETER(FMatrix44f, WorldToPLY)
+		SHADER_PARAMETER(FMatrix44f, WorldToClip)
+		SHADER_PARAMETER(FMatrix44f, WorldToView)
+		SHADER_PARAMETER(FVector3f, PreViewTranslation)
+		SHADER_PARAMETER(FVector3f, CameraPosition)
+		SHADER_PARAMETER(FVector2f, ScreenSize)
+		SHADER_PARAMETER(FVector2f, FocalLength)
+		SHADER_PARAMETER(uint32, SplatCount)
+		SHADER_PARAMETER(uint32, SHOrder)
+		SHADER_PARAMETER(uint32, NumSHCoeffs)
+		SHADER_PARAMETER(uint32, SHBufferCoeffs)
+		SHADER_PARAMETER(uint32, UseSHRendering)
+		SHADER_PARAMETER(float, OpacityScale)
+		SHADER_PARAMETER(float, SplatScale)
+		SHADER_PARAMETER(uint32, GlobalBaseOffset)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, GlobalBaseOffsetsBuffer)
+		SHADER_PARAMETER(uint32, ProxyIndex)
+		SHADER_PARAMETER(uint32, UseGlobalCompactionPath)
+		SHADER_PARAMETER(uint32, MaxRenderBudget)
+		// OIT新增: MLP输出
+		SHADER_PARAMETER_SRV(StructuredBuffer<float2>, PhiOpacityBuffer)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 256);
+	}
+};
+
+/**
+ * OIT变体VS: 额外传递OITWeight到PS
+ */
+class FGaussianSplatOITVS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGaussianSplatOITVS);
+	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOITVS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_SRV(StructuredBuffer<FGaussianSplatViewData>, ViewDataBuffer)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SortKeysBuffer) // OIT: 恒等映射
+		SHADER_PARAMETER(uint32, SplatCount)
+		SHADER_PARAMETER(uint32, DebugMode)
+		SHADER_PARAMETER(uint32, EnableNanite)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+	}
+};
+
+/**
+ * OIT变体PS: 输出加权累积量 (ColorWeight + LogTransmit)
+ */
+class FGaussianSplatOITPS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGaussianSplatOITPS);
+	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOITPS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FMatrix44f, PrevTranslatedWorldToClip)
+		SHADER_PARAMETER(FVector3f, PreViewTranslation)
+		SHADER_PARAMETER(FVector3f, PrevPreViewTranslation)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+	}
+};
+
+/**
+ * OIT合成PS: 读取OIT累积纹理，执行加权平均解算
+ */
+class FGaussianSplatCompositeOITPS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGaussianSplatCompositeOITPS);
+	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCompositeOITPS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_TEXTURE(Texture2D, OITColorWeightTexture)
+		SHADER_PARAMETER_TEXTURE(Texture2D, OITLogTransmitTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, OITSampler)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+	}
+};
+
+/**
+ * OIT合成VS: 复用全屏三角形 (与原版CompositeVS一致)
+ */
+class FGaussianSplatCompositeOITVS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGaussianSplatCompositeOITVS);
+	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCompositeOITVS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+	}
+};
+
 /**
  * Vertex shader for the sRGB→linear composite pass (full-screen triangle)
  */

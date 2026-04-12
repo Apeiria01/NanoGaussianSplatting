@@ -1,0 +1,283 @@
+// OIT变体: CalcViewData的OIT版本
+// 在原始CalcViewData基础上，额外读取MLP输出的phi/opacity，
+// 计算OIT权重 w = φ² + φ/d² + exp(smax/d) 并写入ViewData.OITWeight
+//
+// 与CalcViewData.usf的区别:
+//   1. 新增 PhiOpacityBuffer 输入 (来自MLPForwardCS)
+//   2. opacity 使用MLP输出替代静态值
+//   3. 计算并写入 OITWeight
+
+#include "/Plugin/NanoGS/Private/GaussianSplatting.ush"
+
+// ===== 与CalcViewData.usf相同的输入 =====
+ByteAddressBuffer PositionBuffer;
+ByteAddressBuffer RotationBuffer;
+ByteAddressBuffer ScaleBuffer;
+ByteAddressBuffer ColorOpacityBuffer;
+ByteAddressBuffer SHBuffer;
+RWStructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+
+// 集群可见性 (与CalcViewData.usf一致)
+StructuredBuffer<uint> SplatClusterIndexBuffer;
+StructuredBuffer<uint> ClusterVisibilityBitmap;
+StructuredBuffer<uint> LODClusterSelectedBitmap;
+StructuredBuffer<uint> SelectedClusterBuffer;
+uint UseClusterCulling;
+uint UseLODRendering;
+uint OriginalSplatCount;
+
+// 紧凑模式 (与CalcViewData.usf一致)
+StructuredBuffer<uint> CompactedSplatIndices;
+uint UseCompaction;
+uint VisibleSplatCount;
+
+// 变换矩阵和参数 (与CalcViewData.usf一致)
+float4x4 LocalToWorld;
+float4x4 WorldToPLY;
+float4x4 WorldToClip;
+float4x4 WorldToView;
+float3 PreViewTranslation;
+float3 CameraPosition;
+float2 ScreenSize;
+float2 FocalLength;
+uint SplatCount;
+uint SHOrder;
+uint NumSHCoeffs;
+uint SHBufferCoeffs;
+uint UseSHRendering;
+float OpacityScale;
+float SplatScale;
+uint GlobalBaseOffset;
+StructuredBuffer<uint> GlobalBaseOffsetsBuffer;
+uint ProxyIndex;
+uint UseGlobalCompactionPath;
+uint MaxRenderBudget;
+
+// ===== OIT新增: MLP输出缓冲区 =====
+StructuredBuffer<float2> PhiOpacityBuffer; // [phi, opacity] per splat，来自MLPForwardCS
+
+// 集群可见性检查 (与CalcViewData.usf一致)
+bool IsClusterVisible(uint clusterIndex)
+{
+	uint bitmapIndex = clusterIndex / 32;
+	uint bitMask = 1u << (clusterIndex % 32);
+	return (ClusterVisibilityBitmap[bitmapIndex] & bitMask) != 0;
+}
+
+bool IsLODClusterSelected(uint clusterIndex)
+{
+	uint bitmapIndex = clusterIndex / 32;
+	uint bitMask = 1u << (clusterIndex % 32);
+	return (LODClusterSelectedBitmap[bitmapIndex] & bitMask) != 0;
+}
+
+void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
+{
+	FGaussianSplatViewData viewData;
+	viewData.ClipPosition = float4(0, 0, 0, -1);
+	viewData.TranslatedWorldPos = float3(0, 0, 0);
+	viewData.OITWeight = 0;
+	viewData.PackedColorRG = 0;
+	viewData.PackedColorBA = 0;
+	viewData.Axis1 = float2(0, 0);
+	viewData.Axis2 = float2(0, 0);
+	viewData.ClusterID = clusterID;
+	viewData.Padding = lodLevel;
+	ViewDataBuffer[outputIndex] = viewData;
+}
+
+// OIT变体的ProcessSplat: 计算OIT权重
+void ProcessSplatOIT(uint splatIndex, uint outputIndex, uint selectedClusterID, uint selectedLODLevel)
+{
+	// ===== 加载属性 (与CalcViewData.usf一致) =====
+	float3 localPos = asfloat(PositionBuffer.Load3(splatIndex * 12));
+	float4 rotation = asfloat(RotationBuffer.Load4(splatIndex * 16));
+	float3 scale = asfloat(ScaleBuffer.Load3(splatIndex * 12)) * SplatScale;
+	uint packedColorOpacity = ColorOpacityBuffer.Load(splatIndex * 4);
+	float4 colorOpacity;
+	colorOpacity.r = (packedColorOpacity & 0xFF) / 255.0;
+	colorOpacity.g = ((packedColorOpacity >> 8) & 0xFF) / 255.0;
+	colorOpacity.b = ((packedColorOpacity >> 16) & 0xFF) / 255.0;
+	colorOpacity.a = ((packedColorOpacity >> 24) & 0xFF) / 255.0;
+
+	// ===== OIT: 从MLP缓冲区读取phi和opacity =====
+	float2 phiOpacity = PhiOpacityBuffer[splatIndex];
+	float phi = phiOpacity.x;
+	float mlpOpacity = phiOpacity.y; // MLP输出的视角相关opacity
+	float opacity = mlpOpacity;      // 替代静态opacity
+
+	// 变换到世界空间和裁剪空间
+	float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+	float4 clipPos = mul(worldPos, WorldToClip);
+	float3 translatedWorldPos = worldPos.xyz + PreViewTranslation;
+
+	if (clipPos.w <= 0.0)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	// 视空间变换
+	float4 viewPos = mul(worldPos, WorldToView);
+	float tanFovX = (ScreenSize.x * 0.5) / FocalLength.x;
+	float tanFovY = (ScreenSize.y * 0.5) / FocalLength.y;
+	float limX = 1.3 * tanFovX;
+	float limY = 1.3 * tanFovY;
+	viewPos.x = clamp(viewPos.x / viewPos.z, -limX, limX) * viewPos.z;
+	viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
+
+	// 协方差计算 (与CalcViewData.usf一致)
+	float3x3 cov3D_local = CalcCovariance3D(rotation, scale);
+	float3x3 localToWorldRot = (float3x3)LocalToWorld;
+	float3x3 cov3D_world = mul(transpose(localToWorldRot), mul(cov3D_local, localToWorldRot));
+	float3x3 viewMat = (float3x3)WorldToView;
+	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
+
+	// 分解主轴 (与CalcViewData.usf一致)
+	float2 axis1, axis2;
+	DecomposeCovariance2D(cov2D, axis1, axis2);
+	axis1 = axis1 / ScreenSize * 4.0;
+	axis2 = axis2 / ScreenSize * 4.0;
+
+	float maxAxisSize = 2.0;
+	if (any(isnan(axis1)) || any(isinf(axis1)) || length(axis1) > maxAxisSize)
+		axis1 = float2(0.01, 0.0);
+	if (any(isnan(axis2)) || any(isinf(axis2)) || length(axis2) > maxAxisSize)
+		axis2 = float2(0.0, 0.01);
+
+	// 视锥剔除 (与CalcViewData.usf一致)
+	float2 ndcCenter = clipPos.xy / clipPos.w;
+	float2 ndcExtent = abs(axis1) + abs(axis2);
+	if (ndcCenter.x - ndcExtent.x > 1.0 || ndcCenter.x + ndcExtent.x < -1.0 ||
+		ndcCenter.y - ndcExtent.y > 1.0 || ndcCenter.y + ndcExtent.y < -1.0)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	// 计算颜色 (与CalcViewData.usf一致)
+	float3 finalColor;
+	if (UseSHRendering && NumSHCoeffs > 0)
+	{
+		float3 shDC;
+		float3 sh[15];
+		LoadSH(SHBuffer, splatIndex, SHBufferCoeffs, NumSHCoeffs, shDC, sh);
+
+		float3 viewDirWorld = normalize(CameraPosition - worldPos.xyz);
+		float3 viewDirLocal = mul(viewDirWorld, transpose((float3x3)LocalToWorld));
+		float3 viewDirPLY = float3(viewDirLocal.y, -viewDirLocal.z, viewDirLocal.x);
+		viewDirPLY = -viewDirPLY;
+		viewDirPLY = normalize(viewDirPLY);
+
+		float3 shColor = EvaluateSH(viewDirPLY, shDC, sh, SHOrder);
+		finalColor = max(0.5 + shColor, 0.0);
+	}
+	else
+	{
+		finalColor = colorOpacity.rgb;
+	}
+
+	// ===== OIT: 计算深度和权重 =====
+	float d = length(worldPos.xyz - CameraPosition);       // 相机到高斯的欧氏距离
+	float s_max = max(scale.x, max(scale.y, scale.z));     // 最大scale分量
+	// Mobile-GS论文 Eq.(3): w = φ² + φ/d² + exp(smax/d)
+	float oitWeight = phi * phi + phi / (d * d + 1e-6) + exp(s_max / (d + 1e-6));
+
+	// ===== 写入ViewData =====
+	FGaussianSplatViewData viewData;
+	viewData.ClipPosition = clipPos;
+	viewData.TranslatedWorldPos = translatedWorldPos;
+	viewData.OITWeight = oitWeight;  // OIT权重
+	viewData.PackedColorRG = PackHalf2x16(finalColor.rg);
+	viewData.PackedColorBA = PackHalf2x16(float2(finalColor.b, opacity)); // 使用MLP opacity
+	viewData.Axis1 = axis1;
+	viewData.Axis2 = axis2;
+	viewData.ClusterID = selectedClusterID;
+	viewData.Padding = selectedLODLevel;
+	ViewDataBuffer[outputIndex] = viewData;
+}
+
+// ===== 主入口 (与CalcViewData.usf逻辑一致，仅调用ProcessSplatOIT) =====
+[numthreads(256, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint threadIndex = DispatchThreadId.x;
+
+	// 紧凑模式
+	if (UseCompaction)
+	{
+		if (threadIndex >= VisibleSplatCount)
+			return;
+
+		uint CompactionGlobalBase = UseGlobalCompactionPath
+			? GlobalBaseOffsetsBuffer[ProxyIndex]
+			: GlobalBaseOffset;
+
+		if (MaxRenderBudget > 0u && (CompactionGlobalBase + threadIndex) >= MaxRenderBudget)
+			return;
+
+		uint splatIndex = CompactedSplatIndices[threadIndex];
+		uint clusterIndex = SplatClusterIndexBuffer[splatIndex];
+		bool isLODSplat = (splatIndex >= OriginalSplatCount);
+
+		uint selectedClusterID = clusterIndex;
+		uint selectedLODLevel = isLODSplat ? 1 : 0;
+
+		if (!isLODSplat)
+		{
+			uint packedSelected = SelectedClusterBuffer[clusterIndex];
+			selectedClusterID = packedSelected & 0x00FFFFFF;
+			selectedLODLevel = (packedSelected >> 24) & 0xFF;
+		}
+
+		ProcessSplatOIT(splatIndex, CompactionGlobalBase + threadIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	// 非紧凑模式
+	uint splatIndex = threadIndex;
+	if (splatIndex >= SplatCount)
+		return;
+
+	bool isLODSplat = (splatIndex >= OriginalSplatCount);
+	uint clusterIndex = 0;
+	uint selectedClusterID = 0;
+	uint selectedLODLevel = 0;
+
+	if (UseClusterCulling)
+	{
+		clusterIndex = SplatClusterIndexBuffer[splatIndex];
+
+		if (isLODSplat)
+		{
+			if (!UseLODRendering || !IsLODClusterSelected(clusterIndex))
+			{
+				WriteInvalidSplat(GlobalBaseOffset + splatIndex, clusterIndex, 1);
+				return;
+			}
+			selectedClusterID = clusterIndex;
+			selectedLODLevel = 1;
+		}
+		else
+		{
+			uint leafClusterIndex = clusterIndex;
+			uint packedSelected = SelectedClusterBuffer[leafClusterIndex];
+			selectedClusterID = packedSelected & 0x00FFFFFF;
+			selectedLODLevel = (packedSelected >> 24) & 0xFF;
+
+			if (!IsClusterVisible(leafClusterIndex))
+			{
+				WriteInvalidSplat(GlobalBaseOffset + splatIndex, selectedClusterID, selectedLODLevel);
+				return;
+			}
+
+			if (UseLODRendering && selectedClusterID != leafClusterIndex)
+			{
+				WriteInvalidSplat(GlobalBaseOffset + splatIndex, selectedClusterID, selectedLODLevel);
+				return;
+			}
+		}
+	}
+
+	ProcessSplatOIT(splatIndex, GlobalBaseOffset + splatIndex, selectedClusterID, selectedLODLevel);
+}

@@ -56,6 +56,14 @@ struct NANOGS_API FGaussianGlobalAccumulator
 	FUnorderedAccessViewRHIRef GlobalSortParamsBufferUAV;  // Written by FPrefixSumVisibleCountsCS
 
 	//----------------------------------------------------------------------
+	// OIT (Order-Independent Transparency) 恒等映射缓冲区
+	//----------------------------------------------------------------------
+
+	/** OIT恒等映射键: buffer[i] = i，OIT模式下替代排序后的SortKeysBuffer */
+	FBufferRHIRef OITIdentityKeysBuffer;
+	FShaderResourceViewRHIRef OITIdentityKeysBufferSRV;
+
+	//----------------------------------------------------------------------
 	// Global compaction path: fixed-size buffers (allocated once, MAX_PROXY_COUNT)
 	//----------------------------------------------------------------------
 
@@ -101,6 +109,7 @@ struct NANOGS_API FGaussianGlobalAccumulator
 	bool bHasCachedSortData = false;
 	uint32 CachedTotalSplatCount = 0;
 	FMatrix CachedViewProjectionMatrix = FMatrix::Identity;
+	bool CachedUseOIT = false;  // 缓存OIT模式状态，切换时使缓存失效
 
 	//----------------------------------------------------------------------
 	// Previous frame data for velocity calculation (per-view)

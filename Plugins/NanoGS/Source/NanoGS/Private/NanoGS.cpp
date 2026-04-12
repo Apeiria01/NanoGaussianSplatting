@@ -33,6 +33,16 @@ BEGIN_SHADER_PARAMETER_STRUCT(FGaussianCompositePassParameters, )
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
+// OIT合成pass参数: 声明OIT累积纹理用于RDG屏障追踪
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianOITCompositePassParameters, )
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, OITColorWeightTexture)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, OITLogTransmitTexture)
+	RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
+// OIT渲染模式CVar (定义在GaussianSplatRenderer.cpp)
+extern TAutoConsoleVariable<int32> CVarUseOITRendering;
+
 //----------------------------------------------------------------------
 // Console Variables for Gaussian Splatting
 //----------------------------------------------------------------------
@@ -265,6 +275,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 	int32 DebugMode = CVarShowClusterBounds.GetValueOnRenderThread();
 	const bool bUseCudaRasterizerBridge = (CVarUseCudaRasterizerBridge.GetValueOnRenderThread() != 0);
+	const bool bUseOIT = (CVarUseOITRendering.GetValueOnRenderThread() != 0);
 
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
@@ -276,24 +287,66 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
 	FRDGTexture* IntermediateTexture = GraphBuilder.CreateTexture(IntermediateDesc, TEXT("GaussianSplatIntermediateRT"));
 
-	// Pass 1: Render splats to intermediate RT (sRGB blending)
-	FRenderTargetParameters* Pass1Parameters = GraphBuilder.AllocParameters<FRenderTargetParameters>();
-	Pass1Parameters->RenderTargets[0] = FRenderTargetBinding(IntermediateTexture, ERenderTargetLoadAction::EClear);
-	// Bind velocity texture for TAA/TSR motion vector output
-	if (VelocityTexture)
+	// OIT累积纹理 (仅OIT模式使用)
+	FRDGTexture* OITColorWeightTexture = nullptr;
+	FRDGTexture* OITLogTransmitTexture = nullptr;
+	if (bUseOIT)
 	{
-		Pass1Parameters->RenderTargets[1] = FRenderTargetBinding(VelocityTexture, ERenderTargetLoadAction::ELoad);
+		// OIT ColorWeight: RGB = Σ(c×α×w), A = Σ(α×w)
+		FRDGTextureDesc OITCWDesc = FRDGTextureDesc::Create2D(
+			RenderExtent, PF_FloatRGBA,
+			FClearValueBinding(FLinearColor::Transparent),
+			TexCreate_RenderTargetable | TexCreate_ShaderResource);
+		OITColorWeightTexture = GraphBuilder.CreateTexture(OITCWDesc, TEXT("OIT_ColorWeight"));
+
+		// OIT LogTransmit: R = Σlog(1-α)
+		FRDGTextureDesc OITLTDesc = FRDGTextureDesc::Create2D(
+			RenderExtent, PF_R16F,
+			FClearValueBinding(FLinearColor::Transparent),
+			TexCreate_RenderTargetable | TexCreate_ShaderResource);
+		OITLogTransmitTexture = GraphBuilder.CreateTexture(OITLTDesc, TEXT("OIT_LogTransmit"));
 	}
-	if (DepthTexture)
+
+	// Pass 1: 渲染splats到中间RT (原始) 或 OIT累积纹理
+	FRenderTargetParameters* Pass1Parameters = GraphBuilder.AllocParameters<FRenderTargetParameters>();
+	if (bUseOIT)
 	{
-		// Enable depth writes so TSR/TAA can properly detect disocclusion
-		// Splats will write their center depth for each rendered pixel
-		Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
-			DepthTexture,
-			ERenderTargetLoadAction::ELoad,
-			ERenderTargetLoadAction::ELoad,
-			FExclusiveDepthStencil::DepthWrite_StencilWrite
-		);
+		// OIT: 两个累积纹理 + 速度纹理
+		Pass1Parameters->RenderTargets[0] = FRenderTargetBinding(OITColorWeightTexture, ERenderTargetLoadAction::EClear);
+		Pass1Parameters->RenderTargets[1] = FRenderTargetBinding(OITLogTransmitTexture, ERenderTargetLoadAction::EClear);
+		if (VelocityTexture)
+		{
+			Pass1Parameters->RenderTargets[2] = FRenderTargetBinding(VelocityTexture, ERenderTargetLoadAction::ELoad);
+		}
+		// OIT: 只读深度测试 (被场景不透明几何遮挡) + 可写stencil (TSR标记)
+		// 不写深度: 无序渲染时深度写入会导致splat间错误遮挡
+		if (DepthTexture)
+		{
+			Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
+				DepthTexture,
+				ERenderTargetLoadAction::ELoad,
+				ERenderTargetLoadAction::ELoad,
+				FExclusiveDepthStencil::DepthRead_StencilWrite
+			);
+		}
+	}
+	else
+	{
+		// 原始路径: 中间sRGB RT + 速度 + 深度
+		Pass1Parameters->RenderTargets[0] = FRenderTargetBinding(IntermediateTexture, ERenderTargetLoadAction::EClear);
+		if (VelocityTexture)
+		{
+			Pass1Parameters->RenderTargets[1] = FRenderTargetBinding(VelocityTexture, ERenderTargetLoadAction::ELoad);
+		}
+		if (DepthTexture)
+		{
+			Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
+				DepthTexture,
+				ERenderTargetLoadAction::ELoad,
+				ERenderTargetLoadAction::ELoad,
+				FExclusiveDepthStencil::DepthWrite_StencilWrite
+			);
+		}
 	}
 
 	if (!GlobalAccumulator.IsValid())
@@ -434,7 +487,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, MaxRenderBudget, RenderExtent, bUseCudaRasterizerBridge, ComputeResult](FRHICommandListImmediate& RHICmdList)
+			 CurrentDebugForceLODLevel, MaxRenderBudget, RenderExtent, bUseCudaRasterizerBridge, bUseOIT, ComputeResult](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCompute_Global);
@@ -474,6 +527,13 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				{
 					bCanSkipAdjusted = false;
 					// Also invalidate the global accumulator cache since proxy set changed
+					RawAccumulator->bHasCachedSortData = false;
+				}
+
+				// OIT模式切换时使缓存失效 (OIT与原始路径的ViewData/排序数据不兼容)
+				if (bUseOIT != RawAccumulator->CachedUseOIT)
+				{
+					bCanSkipAdjusted = false;
 					RawAccumulator->bHasCachedSortData = false;
 				}
 
@@ -594,34 +654,71 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						{
 							const auto& Info = ValidProxies[i];
 							FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
-							if (!GPUResources) continue;  // Extra safety check
+							if (!GPUResources) continue;
 							int32 SplatCount = Info.Proxy->GetSplatCount();
 							int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
 
-							FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
-								RHICmdList, *SceneView, GPUResources,
-								Info.LocalToWorld,
-								SplatCount,
-								OriginalSplatCount,
-								Info.Proxy->GetSHOrder(),
-								Info.Proxy->GetOpacityScale(),
-								Info.Proxy->GetSplatScale(),
-								i,
-								RawAccumulator,
-								MaxRenderBudget);
+							if (bUseOIT)
+							{
+								// OIT: MLP推理 → CalcViewDataOIT (紧凑模式)
+								FRHIBufferCreateDesc PhiDesc = FRHIBufferCreateDesc::Create(
+									TEXT("PhiOpacityBuffer"),
+									SplatCount * 2 * sizeof(float),
+									2 * sizeof(float),
+									BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer)
+									.SetInitialState(ERHIAccess::UAVCompute);
+								FBufferRHIRef PhiOpacityBuffer = RHICmdList.CreateBuffer(PhiDesc);
+
+								FGaussianSplatRenderer::DispatchMLPForward(
+									RHICmdList, GPUResources,
+									FVector3f(SceneView->ViewLocation),
+									SplatCount,
+									Info.Proxy->GetOpacityScale(),
+									PhiOpacityBuffer);
+
+								FShaderResourceViewRHIRef PhiSRV = RHICmdList.CreateShaderResourceView(
+									PhiOpacityBuffer, FRHIViewDesc::CreateBufferSRV()
+										.SetType(FRHIViewDesc::EBufferType::Structured)
+										.SetStride(2 * sizeof(float)));
+
+								FGaussianSplatRenderer::DispatchCalcViewDataOITCompactedGlobal(
+									RHICmdList, *SceneView, GPUResources,
+									Info.LocalToWorld,
+									SplatCount, OriginalSplatCount,
+									Info.Proxy->GetSHOrder(),
+									Info.Proxy->GetOpacityScale(),
+									Info.Proxy->GetSplatScale(),
+									i, RawAccumulator, MaxRenderBudget,
+									PhiSRV);
+							}
+							else
+							{
+								FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
+									RHICmdList, *SceneView, GPUResources,
+									Info.LocalToWorld,
+									SplatCount, OriginalSplatCount,
+									Info.Proxy->GetSHOrder(),
+									Info.Proxy->GetOpacityScale(),
+									Info.Proxy->GetSplatScale(),
+									i, RawAccumulator, MaxRenderBudget);
+							}
 						}
 
 						// --------------------------------------------------
-						// Phase 3: Single global CalcDistances + RadixSort
-						// (all indirect — count driven by GPU prefix sum)
+						// Phase 3: CalcDistances + RadixSort (原始路径)
+						// OIT模式跳过排序 (加权平均混合与顺序无关)
 						// --------------------------------------------------
-						FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(RHICmdList, RawAccumulator);
-						FGaussianSplatRenderer::DispatchRadixSortGlobalIndirect(RHICmdList, RawAccumulator);
+						if (!bUseOIT)
+						{
+							FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(RHICmdList, RawAccumulator);
+							FGaussianSplatRenderer::DispatchRadixSortGlobalIndirect(RHICmdList, RawAccumulator);
+						}
 
 						// Update caches — only for processed proxies
 						RawAccumulator->bHasCachedSortData = true;
 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
+						RawAccumulator->CachedUseOIT = bUseOIT;
 
 						for (int32 i = 0; i < ValidProxies.Num(); i++)
 						{
@@ -692,29 +789,73 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 									Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
 							}
 
-							// CalcViewData → writes to GlobalViewDataBuffer at GlobalBaseOffset
-							FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
-								RHICmdList, *SceneView, GPUResources,
-								Info.LocalToWorld,
-								Info.Proxy->GetSplatCount(),
-								Info.Proxy->GetSHOrder(),
-								Info.Proxy->GetOpacityScale(),
-								Info.Proxy->GetSplatScale(),
-								Info.bUseLODRendering,
-								Info.GlobalBaseOffset,
-								RawAccumulator);
+							if (bUseOIT)
+							{
+								// OIT: MLP推理 → CalcViewDataOIT
+								int32 ProxySplatCount = Info.Proxy->GetSplatCount();
+								FRHIBufferCreateDesc PhiDesc = FRHIBufferCreateDesc::Create(
+									TEXT("PhiOpacityBuffer"),
+									ProxySplatCount * 2 * sizeof(float),
+									2 * sizeof(float),
+									BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer)
+									.SetInitialState(ERHIAccess::UAVCompute);
+								FBufferRHIRef PhiOpacityBuffer = RHICmdList.CreateBuffer(PhiDesc);
+
+								FGaussianSplatRenderer::DispatchMLPForward(
+									RHICmdList, GPUResources,
+									FVector3f(SceneView->ViewLocation),
+									ProxySplatCount,
+									Info.Proxy->GetOpacityScale(),
+									PhiOpacityBuffer);
+
+								FShaderResourceViewRHIRef PhiSRV = RHICmdList.CreateShaderResourceView(
+									PhiOpacityBuffer, FRHIViewDesc::CreateBufferSRV()
+										.SetType(FRHIViewDesc::EBufferType::Structured)
+										.SetStride(2 * sizeof(float)));
+
+								FGaussianSplatRenderer::DispatchCalcViewDataOIT(
+									RHICmdList, *SceneView, GPUResources,
+									Info.LocalToWorld,
+									ProxySplatCount,
+									Info.Proxy->GetSHOrder(),
+									Info.Proxy->GetOpacityScale(),
+									Info.Proxy->GetSplatScale(),
+									Info.bUseLODRendering,
+									Info.GlobalBaseOffset,
+									RawAccumulator,
+									PhiSRV);
+							}
+							else
+							{
+								// 原始路径: CalcViewData → GlobalViewDataBuffer
+								FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
+									RHICmdList, *SceneView, GPUResources,
+									Info.LocalToWorld,
+									Info.Proxy->GetSplatCount(),
+									Info.Proxy->GetSHOrder(),
+									Info.Proxy->GetOpacityScale(),
+									Info.Proxy->GetSplatScale(),
+									Info.bUseLODRendering,
+									Info.GlobalBaseOffset,
+									RawAccumulator);
+							}
 						}
 
 						// --------------------------------------------------
-						// Phase 2: Single global CalcDistances + RadixSort
+						// Phase 2: CalcDistances + RadixSort (原始路径)
+						// OIT模式跳过排序
 						// --------------------------------------------------
-						FGaussianSplatRenderer::DispatchCalcDistancesGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
-						FGaussianSplatRenderer::DispatchRadixSortGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
+						if (!bUseOIT)
+						{
+							FGaussianSplatRenderer::DispatchCalcDistancesGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
+							FGaussianSplatRenderer::DispatchRadixSortGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
+						}
 
 						// Update caches
 						RawAccumulator->bHasCachedSortData = true;
 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
+						RawAccumulator->CachedUseOIT = bUseOIT;
 
 						for (const auto& Info : ValidProxies)
 						{
@@ -743,32 +884,73 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
 			Pass1Parameters,
 			ERDGPassFlags::Raster,
-			[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, ComputeResult](FRHICommandListImmediate& RHICmdList)
+			[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, bUseOIT, ComputeResult](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView || !ComputeResult->bHasValidProxies) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
 
-				if (ComputeResult->bUseCompactionPath)
+				if (bUseOIT)
 				{
-					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
-						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
+					// OIT: 使用加法混合绘制到累积纹理 (无需排序)
+					if (ComputeResult->bUseCompactionPath)
+					{
+						FGaussianSplatRenderer::DrawSplatsOITGlobalIndirect(
+							RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
+					}
+					else
+					{
+						FGaussianSplatRenderer::DrawSplatsOIT(
+							RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer,
+							(int32)ComputeResult->CappedTotalSplatCount, DebugMode);
+					}
 				}
 				else
 				{
-					FGaussianSplatRenderer::DrawSplatsGlobal(
-						RHICmdList, *SceneView, RawAccumulator,
-						SharedIndexBuffer, (int32)ComputeResult->CappedTotalSplatCount, DebugMode);
+					// 原始路径: 排序后的alpha混合
+					if (ComputeResult->bUseCompactionPath)
+					{
+						FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
+							RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
+					}
+					else
+					{
+						FGaussianSplatRenderer::DrawSplatsGlobal(
+							RHICmdList, *SceneView, RawAccumulator,
+							SharedIndexBuffer, (int32)ComputeResult->CappedTotalSplatCount, DebugMode);
+					}
 				}
 			}
 		);
 
-		// Pass 2: Composite intermediate sRGB RT onto SceneColor (sRGB → linear conversion)
-		// Use FGaussianCompositePassParameters to declare IntermediateTexture as an RDG-tracked
-		// shader resource input. This ensures RDG inserts the required RTV→SRV resource barrier
-		// between Pass 1 (which writes IntermediateTexture as a render target) and this pass
-		// (which reads it as a shader resource). Without this, the GPU may read stale/partial
-		// data from IntermediateTexture, producing rectangular block artifacts.
+		// Pass 2: 合成到SceneColor
 		ERenderTargetLoadAction CompositeColorLoadAction = (DebugMode > 0) ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad;
+
+		if (bUseOIT)
+		{
+			// OIT合成: 解算加权平均并写入SceneColor
+			FGaussianOITCompositePassParameters* OITPass2Params = GraphBuilder.AllocParameters<FGaussianOITCompositePassParameters>();
+			OITPass2Params->OITColorWeightTexture = OITColorWeightTexture;
+			OITPass2Params->OITLogTransmitTexture = OITLogTransmitTexture;
+			OITPass2Params->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
+
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("GaussianSplat_OITComposite"),
+				OITPass2Params,
+				ERDGPassFlags::Raster,
+				[SceneView, OITColorWeightTexture, OITLogTransmitTexture](FRHICommandListImmediate& RHICmdList)
+				{
+					if (!SceneView) return;
+					FRHITexture* CWRHI = OITColorWeightTexture->GetRHI();
+					FRHITexture* LTRHI = OITLogTransmitTexture->GetRHI();
+					if (!CWRHI || !LTRHI) return;
+					FGaussianSplatRenderer::CompositeOITToSceneColor(RHICmdList, *SceneView, CWRHI, LTRHI);
+				}
+			);
+		}
+		else
+		{
+		// 原始sRGB合成 + CUDA debug overlay
+		// RDG屏障追踪: IntermediateTexture从RTV→SRV
 		FGaussianCompositePassParameters* Pass2Parameters = GraphBuilder.AllocParameters<FGaussianCompositePassParameters>();
 		Pass2Parameters->IntermediateTexture = IntermediateTexture;
 		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
@@ -852,6 +1034,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					CudaDebugExposure);
 			}
 		);
+		} // !bUseOIT
 }
 
 void FNanoGSModule::ShutdownModule()

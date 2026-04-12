@@ -1,0 +1,87 @@
+// OIT变体: 加权平均解算合成
+//
+// 输入:
+//   OITColorWeightTexture (RT0): RGB = Σ(c×α×w), A = Σ(α×w)
+//   OITLogTransmitTexture (RT1): R = Σlog(1-α_i)
+//
+// 解算公式 (Mobile-GS论文 Eq.2):
+//   T = exp(Σlog(1-α_i))              // 总透射率
+//   C_fg = Σ(c×α×w) / Σ(α×w)         // 加权平均前景色
+//   C_out = C_fg × (1-T) + T × C_bg   // 与背景混合
+//
+// 与GaussianSplatComposite.usf的区别:
+//   1. 读取两个输入纹理而非一个
+//   2. 使用OIT解算公式代替un-premultiply
+//   3. 输出的alpha = (1-T) 表示前景覆盖度
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D OITColorWeightTexture;  // RT0: (Σc×α×w, Σα×w)
+Texture2D OITLogTransmitTexture;  // RT1: Σlog(1-α)
+SamplerState OITSampler;
+
+// 反向ACES色调映射 (与GaussianSplatComposite.usf一致)
+float3 InverseACESTonemap(float3 color)
+{
+	float a = 2.51;
+	float b = 0.03;
+	float c = 2.43;
+	float d = 0.59;
+	float e = 0.14;
+
+	color = clamp(color, 0.0, 0.99);
+	float3 A = a - color * c;
+	float3 B = b - color * d;
+	float3 C = -color * e;
+
+	return (-B + sqrt(max(B * B - 4.0 * A * C, 0.0))) / (2.0 * A);
+}
+
+struct FCompositeVSOutput
+{
+	float4 Position : SV_POSITION;
+};
+
+// 全屏三角形 (与原版一致)
+FCompositeVSOutput MainVS(uint VertexId : SV_VertexID)
+{
+	FCompositeVSOutput Output;
+	float2 UV = float2((VertexId << 1) & 2, VertexId & 2);
+	Output.Position = float4(UV * 2.0 - 1.0, 0.0, 1.0);
+	return Output;
+}
+
+float4 MainPS(FCompositeVSOutput Input) : SV_Target0
+{
+	int2 PixelPos = int2(Input.Position.xy);
+
+	// 读取OIT累积量
+	float4 colorWeight = OITColorWeightTexture.Load(int3(PixelPos, 0));
+	float logT = OITLogTransmitTexture.Load(int3(PixelPos, 0)).r;
+
+	// 加权alpha和为零表示无splat贡献
+	if (colorWeight.a <= 1e-5)
+	{
+		discard;
+	}
+
+	// ===== OIT解算 =====
+	float T = exp(logT);                            // 总透射率
+	float invW = 1.0 / max(colorWeight.a, 1e-5);    // 1 / Σ(α×w)
+	float3 srgbColor = colorWeight.rgb * invW;       // 加权平均颜色 (sRGB空间)
+	srgbColor = saturate(srgbColor);                 // 夹紧到[0,1]
+
+	float alpha = 1.0 - T;  // 前景覆盖度
+
+	// sRGB → linear
+	float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
+
+	// 反向ACES色调映射 (确保经过UE色调映射后回到目标颜色)
+	linearColor = InverseACESTonemap(linearColor);
+
+	// 预乘alpha输出
+	float3 linearPremultiplied = linearColor * alpha;
+
+	// Blend state: src + dst × (1-srcAlpha) → 背景部分由硬件混合完成
+	return float4(linearPremultiplied, alpha);
+}

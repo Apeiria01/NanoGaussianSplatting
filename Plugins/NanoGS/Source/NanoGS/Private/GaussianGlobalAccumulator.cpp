@@ -172,6 +172,31 @@ void FGaussianGlobalAccumulator::ResizeIfNeeded(FRHICommandListBase& RHICmdList,
 				.SetStride(UintStride));
 	}
 
+	// --- OIT恒等映射键: buffer[i] = i (OIT模式下替代排序结果) ---
+	{
+		TResourceArray<uint32> IdentityData;
+		IdentityData.SetNumUninitialized(NewAllocatedCount);
+		for (uint32 i = 0; i < NewAllocatedCount; ++i)
+		{
+			IdentityData[i] = i;
+		}
+
+		FRHIResourceCreateInfo CreateInfo(TEXT("OITIdentityKeysBuffer"));
+		CreateInfo.ResourceArray = &IdentityData;
+
+		OITIdentityKeysBuffer = RHICmdList.CreateBuffer(
+			NewAllocatedCount * UintStride,
+			BUF_ShaderResource | BUF_StructuredBuffer,
+			UintStride,
+			ERHIAccess::SRVCompute,
+			CreateInfo);
+
+		OITIdentityKeysBufferSRV = RHICmdList.CreateShaderResourceView(
+			OITIdentityKeysBuffer, FRHIViewDesc::CreateBufferSRV()
+				.SetType(FRHIViewDesc::EBufferType::Structured)
+				.SetStride(UintStride));
+	}
+
 	AllocatedCount = NewAllocatedCount;
 	AllocatedNumTiles = NewNumTiles;
 
@@ -302,6 +327,10 @@ void FGaussianGlobalAccumulator::Release()
 	GlobalSortParamsBuffer.SafeRelease();
 	GlobalSortParamsBufferSRV.SafeRelease();
 	GlobalSortParamsBufferUAV.SafeRelease();
+
+	// OIT恒等映射缓冲区
+	OITIdentityKeysBuffer.SafeRelease();
+	OITIdentityKeysBufferSRV.SafeRelease();
 
 	// Compaction prefix-sum buffers
 	GlobalVisibleCountArrayBuffer.SafeRelease();

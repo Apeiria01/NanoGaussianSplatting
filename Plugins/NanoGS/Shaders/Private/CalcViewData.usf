@@ -74,7 +74,7 @@ void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
 	FGaussianSplatViewData viewData;
 	viewData.ClipPosition = float4(0, 0, 0, -1);
 	viewData.TranslatedWorldPos = float3(0, 0, 0);
-	viewData.TranslatedWorldPosPad = 0;
+	viewData.OITWeight = 0; // 原始路径不使用OIT权重
 	viewData.PackedColorRG = 0;
 	viewData.PackedColorBA = 0;
 	viewData.Axis1 = float2(0, 0);
@@ -217,7 +217,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	FGaussianSplatViewData viewData;
 	viewData.ClipPosition = clipPos;
 	viewData.TranslatedWorldPos = translatedWorldPos;
-	viewData.TranslatedWorldPosPad = 0;
+	viewData.OITWeight = 0; // 原始路径不使用OIT权重
 	viewData.PackedColorRG = PackHalf2x16(finalColor.rg);
 	viewData.PackedColorBA = PackHalf2x16(float2(finalColor.b, opacity));
 	viewData.Axis1 = axis1;

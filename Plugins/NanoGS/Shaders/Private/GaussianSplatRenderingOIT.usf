@@ -1,0 +1,161 @@
+// OIT变体: 使用Mobile-GS加权平均混合的VS+PS
+//
+// 与GaussianSplatRendering.usf的区别:
+//   1. VS新增 OITWeight 输出
+//   2. PS输出OIT累积量而非预乘alpha颜色:
+//      - RT0 (ColorWeight): RGB = color×α×weight, A = α×weight (加法混合)
+//      - RT1 (LogTransmit): R = log(1-α) (加法混合)
+//      - RT2 (Velocity):    保持不变
+//   3. 不需要排序，图元发送顺序无关紧要
+//
+// 配合的Blend State:
+//   RT0: src + dst (纯加法)
+//   RT1: src + dst (纯加法)
+//   RT2: src (替换)
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/NanoGS/Private/GaussianDataTypes.ush"
+
+// Velocity编码 (与GaussianSplatRendering.usf一致)
+float4 EncodeVelocityToTexture(float3 V)
+{
+	V.xy = sign(V.xy) * sqrt(abs(V.xy)) * (2.0 / sqrt(2.0));
+	float4 EncodedV;
+	EncodedV.xy = V.xy * (0.499f * 0.5f) + 32767.0f / 65535.0f;
+	EncodedV.z = V.z * (0.499f * 0.5f) + 32767.0f / 65535.0f;
+	EncodedV.w = 0.0f;
+	return EncodedV;
+}
+
+// ===== 顶点着色器参数 =====
+#if VERTEXSHADER
+StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+StructuredBuffer<uint> SortKeysBuffer; // OIT模式下为恒等映射 (identity: buffer[i] = i)
+uint SplatCount;
+uint DebugMode;
+uint EnableNanite;
+#endif
+
+// ===== 像素着色器参数 =====
+#if PIXELSHADER
+float4x4 PrevTranslatedWorldToClip;
+float3 PreViewTranslation;
+float3 PrevPreViewTranslation;
+#endif
+
+// ===== VS输出 / PS输入 =====
+struct FVertexOutput
+{
+	float4 Position : SV_POSITION;
+	float2 LocalPos : TEXCOORD0;
+	float4 Color : TEXCOORD1;       // .a = opacity (来自MLP)
+	uint DebugFlag : TEXCOORD2;
+	float3 TranslatedWorldPos : TEXCOORD3;
+	float4 CenterClipPos : TEXCOORD4;
+	float OITWeight : TEXCOORD5;    // OIT权重，从ViewData传入
+};
+
+// ===== PS输出: OIT三通道累积 =====
+struct FPixelOutput
+{
+	float4 ColorWeight : SV_Target0;  // RGB = Σ(c×α×w), A = Σ(α×w)
+	float4 LogTransmit : SV_Target1;  // R = Σlog(1-α)
+	float4 Velocity : SV_Target2;     // 速度 (保持不变)
+};
+
+// ===== 顶点着色器 =====
+FVertexOutput MainVS(
+	uint VertexId : SV_VertexID,
+	uint InstanceId : SV_InstanceID)
+{
+	FVertexOutput Output;
+
+	// Quad角点
+	float2 corner;
+	corner.x = (VertexId & 1) ? 1.0 : -1.0;
+	corner.y = (VertexId & 2) ? 1.0 : -1.0;
+
+	// OIT模式: SortKeysBuffer为恒等映射，直接用InstanceId也可
+	uint splatIndex = SortKeysBuffer[InstanceId];
+	FGaussianSplatViewData viewData = ViewDataBuffer[splatIndex];
+
+	Output.DebugFlag = 0;
+	Output.TranslatedWorldPos = viewData.TranslatedWorldPos;
+	Output.CenterClipPos = viewData.ClipPosition;
+	Output.OITWeight = viewData.OITWeight; // 读取OIT权重
+
+	// 无效splat (w <= 0)
+	if (viewData.ClipPosition.w <= 0.0)
+	{
+		Output.Position = float4(0, 0, 0, 1);
+		Output.LocalPos = float2(0, 0);
+		Output.Color = float4(0, 0, 0, 0);
+		Output.TranslatedWorldPos = float3(0, 0, 0);
+		Output.CenterClipPos = float4(0, 0, 0, 1);
+		Output.OITWeight = 0;
+		return Output;
+	}
+
+	// NDC位置和quad偏移 (与原版一致)
+	float2 ndc = viewData.ClipPosition.xy / viewData.ClipPosition.w;
+	float2 offset = corner.x * viewData.Axis1 + corner.y * viewData.Axis2;
+
+	// 解包颜色
+	float2 rg = UnpackHalf2x16(viewData.PackedColorRG);
+	float2 ba = UnpackHalf2x16(viewData.PackedColorBA);
+	Output.Color = float4(rg.x, rg.y, ba.x, ba.y);
+
+	// 最终裁剪位置
+	Output.Position = float4(
+		(ndc + offset) * viewData.ClipPosition.w,
+		viewData.ClipPosition.z,
+		viewData.ClipPosition.w
+	);
+	Output.LocalPos = corner;
+
+	return Output;
+}
+
+// ===== 像素着色器: OIT加权累积 =====
+FPixelOutput MainPS(FVertexOutput Input)
+{
+	FPixelOutput Output;
+
+	// ===== 高斯衰减 (与原版一致) =====
+	float distSq = dot(Input.LocalPos, Input.LocalPos);
+	if (distSq > 1.0)
+		discard;
+
+	static const float EXP4 = exp(-4.0);
+	static const float INV_EXP4 = 1.0 / (1.0 - EXP4);
+	float gaussianWeight = (exp(-4.0 * distSq) - EXP4) * INV_EXP4;
+
+	float alpha = saturate(gaussianWeight * Input.Color.a);
+	if (alpha < 1.0 / 255.0)
+		discard;
+
+	// ===== 速度计算 (与原版一致) =====
+	float2 CurrentNDC = Input.CenterClipPos.xy / Input.CenterClipPos.w;
+	float3 WorldPos = Input.TranslatedWorldPos - PreViewTranslation;
+	float3 PrevTranslatedWorldPos = WorldPos + PrevPreViewTranslation;
+	float4 PrevClipPos = mul(float4(PrevTranslatedWorldPos, 1.0), PrevTranslatedWorldToClip);
+	float2 PrevNDC = PrevClipPos.xy / PrevClipPos.w;
+	float CurrentDeviceZ = Input.CenterClipPos.z / Input.CenterClipPos.w;
+	float PrevDeviceZ = PrevClipPos.z / PrevClipPos.w;
+	float3 Velocity = float3(CurrentNDC - PrevNDC, CurrentDeviceZ - PrevDeviceZ);
+
+	// ===== OIT输出: 加权累积量 =====
+	float w = Input.OITWeight;
+	float aw = alpha * w;  // α × weight
+
+	// RT0: 加权颜色和 + 加权alpha和
+	Output.ColorWeight = float4(Input.Color.rgb * aw, aw);
+
+	// RT1: 对数透射率累积 (加法混合后 = Σlog(1-α_i))
+	Output.LogTransmit = float4(log(max(1.0 - alpha, 1e-6)), 0, 0, 0);
+
+	// RT2: 速度 (替换)
+	Output.Velocity = EncodeVelocityToTexture(Velocity);
+
+	return Output;
+}

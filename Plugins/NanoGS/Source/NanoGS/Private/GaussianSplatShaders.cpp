@@ -18,6 +18,14 @@ IMPLEMENT_GLOBAL_SHADER(FRadixSortPrefixSumCS, "/Plugin/NanoGS/Private/RadixSort
 IMPLEMENT_GLOBAL_SHADER(FRadixSortDigitPrefixSumCS, "/Plugin/NanoGS/Private/RadixSort.usf", "DigitPrefixSumCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FRadixSortScatterCS, "/Plugin/NanoGS/Private/RadixSort.usf", "ScatterCS", SF_Compute);
 
+// OIT (Order-Independent Transparency) 渲染路径着色器
+IMPLEMENT_GLOBAL_SHADER(FMLPForwardCS, "/Plugin/NanoGS/Private/MLPForwardCS.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCalcViewDataOITCS, "/Plugin/NanoGS/Private/CalcViewDataOIT.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOITVS, "/Plugin/NanoGS/Private/GaussianSplatRenderingOIT.usf", "MainVS", SF_Vertex);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOITPS, "/Plugin/NanoGS/Private/GaussianSplatRenderingOIT.usf", "MainPS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositeOITVS, "/Plugin/NanoGS/Private/GaussianSplatCompositeOIT.usf", "MainVS", SF_Vertex);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositeOITPS, "/Plugin/NanoGS/Private/GaussianSplatCompositeOIT.usf", "MainPS", SF_Pixel);
+
 // Cluster culling shaders
 IMPLEMENT_GLOBAL_SHADER(FClusterCullingResetCS, "/Plugin/NanoGS/Private/ClusterCulling.usf", "ResetCounterCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FClusterCullingCS, "/Plugin/NanoGS/Private/ClusterCulling.usf", "MainCS", SF_Compute);

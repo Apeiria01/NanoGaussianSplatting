@@ -1,0 +1,60 @@
+// OIT MLP前向推理占位符 (Mobile-GS OpaictyPhiNN)
+//
+// 功能: 为每个高斯图元计算视角相关的 phi 和 opacity
+// 当前状态: 占位符实现，直接输出默认值 (phi=1.0, opacity=静态opacity)
+// 后续可替换为:
+//   1. 手写3层MLP compute shader (22→256→128→64→phi+opacity)
+//   2. NNE RDG运行时 ONNX推理
+//
+// MLP输入 (22维):
+//   - SH系数 (3 * (sh_degree+1)^2 = 12 for degree 1)
+//   - scale (3)
+//   - rotation (4, 四元数)
+//   - camera-to-gaussian方向 (3)
+//
+// MLP输出 (2维):
+//   - phi: ReLU激活，用于OIT权重公式 w = φ² + φ/d² + exp(smax/d)
+//   - opacity: Sigmoid激活，视角相关的不透明度
+
+#include "/Engine/Private/Common.ush"
+
+// 输入: 原始高斯属性
+ByteAddressBuffer PositionBuffer;      // float3 per splat
+ByteAddressBuffer ScaleBuffer;         // float3 per splat
+ByteAddressBuffer RotationBuffer;      // float4 per splat
+ByteAddressBuffer ColorOpacityBuffer;  // packed RGBA8 per splat
+
+// 输出: phi和opacity对
+RWStructuredBuffer<float2> PhiOpacityBuffer;  // [phi, opacity] per splat
+
+// 参数
+float3 CameraPosition;
+uint SplatCount;
+float OpacityScale;
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint splatIndex = DispatchThreadId.x;
+	if (splatIndex >= SplatCount)
+		return;
+
+	// ===== 占位符实现 =====
+	// 读取静态opacity作为默认值
+	uint packedColorOpacity = ColorOpacityBuffer.Load(splatIndex * 4);
+	float staticOpacity = ((packedColorOpacity >> 24) & 0xFF) / 255.0 * OpacityScale;
+
+	// 默认输出: phi=1.0 (与Mobile-GS初始化一致), opacity=静态值
+	float phi = 1.0;
+	float opacity = staticOpacity;
+
+	// TODO: 实现MLP前向推理
+	// float mlpInput[22] = AssembleMLPInput(splatIndex, CameraPosition);
+	// Layer1: h1 = ReLU(W1 * input + b1)   // 22 → 256
+	// Layer2: h2 = ReLU(W2 * h1 + b2)      // 256 → 128
+	// Layer3: h3 = ReLU(W3 * h2 + b3)      // 128 → 64
+	// phi = ReLU(Wphi * h3 + bphi)          // 64 → 1
+	// opacity = Sigmoid(Wop * h3 + bop)     // 64 → 1
+
+	PhiOpacityBuffer[splatIndex] = float2(phi, opacity);
+}

@@ -22,6 +22,14 @@
 extern TAutoConsoleVariable<int32> CVarShowClusterBounds;
 extern TAutoConsoleVariable<int32> CVarDebugForceLODLevel;
 
+// OIT渲染模式开关 (0=原始路径, 1=OIT路径)
+TAutoConsoleVariable<int32> CVarUseOITRendering(
+	TEXT("r.GaussianSplat.UseOIT"),
+	0,
+	TEXT("0: 原始排序+alpha混合 (默认)\n1: OIT加权平均混合 (无需排序)"),
+	ECVF_RenderThreadSafe
+);
+
 // Helper: Set pixel shader velocity parameters using self-tracked previous frame data.
 // UE5's PrevViewInfo is not populated for PostOpaqueRender callbacks, so we store
 // current frame matrices and use them as "previous" data next frame.
@@ -2047,6 +2055,493 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 
 	// Draw full-screen triangle (3 vertices, no index buffer)
+	RHICmdList.SetStreamSource(0, nullptr, 0);
+	RHICmdList.DrawPrimitive(0, 1, 1);
+}
+
+//----------------------------------------------------------------------
+// OIT (Order-Independent Transparency) 渲染路径实现
+// 基于Mobile-GS的加权平均混合方案，无需深度排序
+//----------------------------------------------------------------------
+
+// OIT版本的速度参数设置 (PS参数结构与原版相同)
+static void SetVelocityOITPSParameters(
+	FGaussianSplatOITPS::FParameters& PSParameters,
+	const FSceneView& View,
+	FGaussianGlobalAccumulator* Accumulator)
+{
+	FMatrix CurTranslatedVP = View.ViewMatrices.GetTranslatedViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix();
+	FVector CurPreViewTranslation = View.ViewMatrices.GetPreViewTranslation();
+	const void* ViewKey = View.State;
+
+	FGaussianGlobalAccumulator::FPrevFrameViewData* PrevData = nullptr;
+	if (Accumulator && ViewKey)
+	{
+		PrevData = Accumulator->PrevFrameDataPerView.Find(ViewKey);
+	}
+
+	if (PrevData)
+	{
+		PSParameters.PrevTranslatedWorldToClip = FMatrix44f(PrevData->TranslatedViewProjectionMatrix);
+		PSParameters.PrevPreViewTranslation = FVector3f(PrevData->PreViewTranslation);
+	}
+	else
+	{
+		PSParameters.PrevTranslatedWorldToClip = FMatrix44f(CurTranslatedVP);
+		PSParameters.PrevPreViewTranslation = FVector3f(CurPreViewTranslation);
+	}
+
+	PSParameters.PreViewTranslation = FVector3f(CurPreViewTranslation);
+
+	// OIT模式下原版路径不运行，需要在此更新PrevFrameData
+	if (Accumulator && ViewKey)
+	{
+		FGaussianGlobalAccumulator::FPrevFrameViewData& Data = Accumulator->PrevFrameDataPerView.FindOrAdd(ViewKey);
+		Data.TranslatedViewProjectionMatrix = CurTranslatedVP;
+		Data.PreViewTranslation = CurPreViewTranslation;
+	}
+}
+
+void FGaussianSplatRenderer::DispatchMLPForward(
+	FRHICommandListImmediate& RHICmdList,
+	FGaussianSplatGPUResources* GPUResources,
+	const FVector3f& CameraPosition,
+	int32 SplatCount,
+	float OpacityScale,
+	FBufferRHIRef PhiOpacityBuffer)
+{
+	SCOPED_DRAW_EVENT(RHICmdList, MLPForwardCS);
+
+	TShaderMapRef<FMLPForwardCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	if (!ComputeShader.IsValid())
+		return;
+
+	// 过渡PhiOpacityBuffer为UAV
+	RHICmdList.Transition(FRHITransitionInfo(PhiOpacityBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+
+	FMLPForwardCS::FParameters Parameters;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
+	Parameters.PhiOpacityBuffer = RHICmdList.CreateUnorderedAccessView(
+		PhiOpacityBuffer, FRHIViewDesc::CreateBufferUAV()
+			.SetType(FRHIViewDesc::EBufferType::Structured)
+			.SetStride(2 * sizeof(float)));
+	Parameters.CameraPosition = CameraPosition;
+	Parameters.SplatCount = SplatCount;
+	Parameters.OpacityScale = OpacityScale;
+
+	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)SplatCount, 256u);
+	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+	RHICmdList.DispatchComputeShader(NumGroups, 1, 1);
+	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+
+	// 过渡为SRV供后续CalcViewDataOIT读取
+	RHICmdList.Transition(FRHITransitionInfo(PhiOpacityBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+}
+
+void FGaussianSplatRenderer::DispatchCalcViewDataOIT(
+	FRHICommandListImmediate& RHICmdList,
+	const FSceneView& View,
+	FGaussianSplatGPUResources* GPUResources,
+	const FMatrix& LocalToWorld,
+	int32 SplatCount,
+	int32 SHOrder,
+	float OpacityScale,
+	float SplatScale,
+	bool bUseLODRendering,
+	uint32 GlobalBaseOffset,
+	FGaussianGlobalAccumulator* GlobalAccumulator,
+	FShaderResourceViewRHIRef PhiOpacityBufferSRV)
+{
+	SCOPED_DRAW_EVENT(RHICmdList, CalcViewDataOIT);
+
+	TShaderMapRef<FGaussianSplatCalcViewDataOITCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	if (!ComputeShader.IsValid())
+		return;
+
+	// 过渡ViewDataBuffer为UAV
+	FBufferRHIRef ViewDataBuf = GlobalAccumulator
+		? GlobalAccumulator->GlobalViewDataBuffer
+		: GPUResources->ViewDataBuffer;
+	RHICmdList.Transition(FRHITransitionInfo(ViewDataBuf, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+
+	// 填充参数 (镜像DispatchCalcViewData，额外加PhiOpacityBuffer)
+	FGaussianSplatCalcViewDataOITCS::FParameters Parameters;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
+	Parameters.SHBuffer = GPUResources->SHBufferSRV;
+	Parameters.ViewDataBuffer = GlobalAccumulator
+		? GlobalAccumulator->GlobalViewDataBufferUAV
+		: GPUResources->ViewDataBufferUAV;
+
+	// Cluster visibility integration
+	Parameters.SplatClusterIndexBuffer = GPUResources->SplatClusterIndexBufferSRV;
+	Parameters.ClusterVisibilityBitmap = GPUResources->ClusterVisibilityBitmapSRV;
+	Parameters.LODClusterSelectedBitmap = GPUResources->LODClusterSelectedBitmapSRV;
+	Parameters.SelectedClusterBuffer = GPUResources->SelectedClusterBufferSRV;
+	Parameters.CompactedSplatIndices = GPUResources->CompactedSplatIndicesBufferSRV;
+	Parameters.UseCompaction = 0;
+	Parameters.VisibleSplatCount = 0;
+
+	if (GPUResources->bHasClusterData)
+	{
+		Parameters.UseClusterCulling = 1;
+		Parameters.UseLODRendering = bUseLODRendering ? 1 : 0;
+		Parameters.OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
+	}
+	else
+	{
+		Parameters.UseClusterCulling = 0;
+		Parameters.UseLODRendering = 0;
+		Parameters.OriginalSplatCount = SplatCount;
+	}
+
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+
+	Parameters.LocalToWorld = FMatrix44f(LocalToWorld);
+	Parameters.WorldToPLY = FMatrix44f(ComputeWorldToPLY(LocalToWorld));
+	Parameters.WorldToClip = FMatrix44f(View.ViewMatrices.GetViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix());
+	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
+	Parameters.WorldToView = FMatrix44f(View.ViewMatrices.GetViewMatrix());
+	Parameters.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
+
+	FIntRect ViewRect = ViewInfo.ViewRect;
+	Parameters.ScreenSize = FVector2f(ViewRect.Width(), ViewRect.Height());
+
+	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
+	Parameters.FocalLength = FVector2f(
+		ProjMatrix.M[0][0] * ViewRect.Width() * 0.5f,
+		ProjMatrix.M[1][1] * ViewRect.Height() * 0.5f
+	);
+
+	Parameters.SplatCount = SplatCount;
+	int32 EffectiveSHOrder = FMath::Min(SHOrder, GPUResources->GetSHBands());
+	Parameters.SHOrder = EffectiveSHOrder;
+	Parameters.NumSHCoeffs = (EffectiveSHOrder == 0) ? 0 : (EffectiveSHOrder == 1) ? 4 : (EffectiveSHOrder == 2) ? 9 : 16;
+	{
+		int32 StoredSHBands = GPUResources->GetSHBands();
+		Parameters.SHBufferCoeffs = (StoredSHBands == 0) ? 0 : (StoredSHBands == 1) ? 4 : (StoredSHBands == 2) ? 9 : 16;
+	}
+	Parameters.UseSHRendering = (EffectiveSHOrder > 0) ? 1 : 0;
+	Parameters.OpacityScale = OpacityScale;
+	Parameters.SplatScale = SplatScale;
+
+	// Not using global compaction path
+	Parameters.GlobalBaseOffset = GlobalBaseOffset;
+	Parameters.GlobalBaseOffsetsBuffer = GPUResources->CompactedSplatIndicesBufferSRV;  // dummy
+	Parameters.ProxyIndex = 0;
+	Parameters.UseGlobalCompactionPath = 0;
+	Parameters.MaxRenderBudget = 0;
+
+	// OIT新增参数
+	Parameters.PhiOpacityBuffer = PhiOpacityBufferSRV;
+
+	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)SplatCount, 256u);
+	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+	RHICmdList.DispatchComputeShader(NumGroups, 1, 1);
+	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+
+	RHICmdList.Transition(FRHITransitionInfo(ViewDataBuf, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+}
+
+void FGaussianSplatRenderer::DispatchCalcViewDataOITCompactedGlobal(
+	FRHICommandListImmediate& RHICmdList,
+	const FSceneView& View,
+	FGaussianSplatGPUResources* GPUResources,
+	const FMatrix& LocalToWorld,
+	int32 SplatCount,
+	int32 OriginalSplatCount,
+	int32 SHOrder,
+	float OpacityScale,
+	float SplatScale,
+	int32 ProxyIndex,
+	FGaussianGlobalAccumulator* GlobalAccumulator,
+	uint32 MaxRenderBudget,
+	FShaderResourceViewRHIRef PhiOpacityBufferSRV)
+{
+	SCOPED_DRAW_EVENT(RHICmdList, CalcViewDataOITCompactedGlobal);
+
+	TShaderMapRef<FGaussianSplatCalcViewDataOITCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	if (!ComputeShader.IsValid())
+		return;
+
+	// 镜像DispatchCalcViewDataCompactedGlobal参数设置，额外加PhiOpacityBuffer
+	// Transition global ViewData buffer to UAV
+	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+
+	FGaussianSplatCalcViewDataOITCS::FParameters Parameters;
+	Parameters.PositionBuffer = GPUResources->PositionBufferSRV;
+	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
+	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
+	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
+	Parameters.SHBuffer = GPUResources->SHBufferSRV;
+
+	// Write into GLOBAL buffer
+	Parameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferUAV;
+
+	// Cluster visibility data
+	Parameters.SplatClusterIndexBuffer   = GPUResources->SplatClusterIndexBufferSRV;
+	Parameters.ClusterVisibilityBitmap   = GPUResources->ClusterVisibilityBitmapSRV;
+	Parameters.LODClusterSelectedBitmap  = GPUResources->LODClusterSelectedBitmapSRV;
+	Parameters.SelectedClusterBuffer     = GPUResources->SelectedClusterBufferSRV;
+	Parameters.UseClusterCulling         = 1;
+	Parameters.UseLODRendering           = 0;
+	Parameters.OriginalSplatCount        = OriginalSplatCount;
+
+	// COMPACTION MODE
+	Parameters.CompactedSplatIndices = GPUResources->CompactedSplatIndicesBufferSRV;
+	Parameters.UseCompaction         = 1;
+	Parameters.VisibleSplatCount     = SplatCount;
+
+	// GLOBAL COMPACTION PATH
+	Parameters.GlobalBaseOffsetsBuffer   = GlobalAccumulator->GlobalBaseOffsetsBufferSRV;
+	Parameters.ProxyIndex                = (uint32)ProxyIndex;
+	Parameters.UseGlobalCompactionPath   = 1;
+	Parameters.GlobalBaseOffset          = 0;
+	Parameters.MaxRenderBudget           = MaxRenderBudget;
+
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+
+	Parameters.LocalToWorld    = FMatrix44f(LocalToWorld);
+	Parameters.WorldToPLY      = FMatrix44f(ComputeWorldToPLY(LocalToWorld));
+	Parameters.WorldToClip     = FMatrix44f(View.ViewMatrices.GetViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix());
+	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
+	Parameters.WorldToView     = FMatrix44f(View.ViewMatrices.GetViewMatrix());
+	Parameters.CameraPosition  = FVector3f(View.ViewMatrices.GetViewOrigin());
+
+	FIntRect ViewRect = ViewInfo.ViewRect;
+	Parameters.ScreenSize = FVector2f(ViewRect.Width(), ViewRect.Height());
+
+	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
+	Parameters.FocalLength = FVector2f(
+		ProjMatrix.M[0][0] * ViewRect.Width() * 0.5f,
+		ProjMatrix.M[1][1] * ViewRect.Height() * 0.5f
+	);
+
+	Parameters.SplatCount    = SplatCount;
+	int32 EffectiveSHOrder = FMath::Min(SHOrder, GPUResources->GetSHBands());
+	Parameters.SHOrder       = EffectiveSHOrder;
+	Parameters.NumSHCoeffs   = (EffectiveSHOrder == 0) ? 0 : (EffectiveSHOrder == 1) ? 4 : (EffectiveSHOrder == 2) ? 9 : 16;
+	{
+		int32 StoredSHBands = GPUResources->GetSHBands();
+		Parameters.SHBufferCoeffs = (StoredSHBands == 0) ? 0 : (StoredSHBands == 1) ? 4 : (StoredSHBands == 2) ? 9 : 16;
+	}
+	Parameters.UseSHRendering = (EffectiveSHOrder > 0) ? 1 : 0;
+	Parameters.OpacityScale  = OpacityScale;
+	Parameters.SplatScale    = SplatScale;
+
+	// OIT新增参数
+	Parameters.PhiOpacityBuffer = PhiOpacityBufferSRV;
+
+	// 使用indirect dispatch (数量由GPU的PrepareIndirectArgs确定)
+	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+	RHICmdList.DispatchIndirectComputeShader(GPUResources->IndirectDispatchArgsBuffer, 0);
+	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+}
+
+void FGaussianSplatRenderer::DrawSplatsOIT(
+	FRHICommandListImmediate& RHICmdList,
+	const FSceneView& View,
+	FGaussianGlobalAccumulator* GlobalAccumulator,
+	FBufferRHIRef IndexBuffer,
+	int32 TotalSplatCount,
+	int32 DebugMode)
+{
+	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawOIT);
+
+	if (!IndexBuffer.IsValid())
+		return;
+
+	TShaderMapRef<FGaussianSplatOITVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FGaussianSplatOITPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+		return;
+
+	// 过渡ViewData为SRV
+	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::SRVGraphics));
+
+	// PSO设置: OIT使用纯加法混合
+	FGraphicsPipelineStateInitializer GraphicsPSOInit;
+	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+
+	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+	// OIT: 关闭深度写入 (无序渲染，深度写入会导致错误遮挡)
+	// 保持深度测试 (仍需被场景不透明几何遮挡)
+	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
+		false, CF_DepthNearOrEqual,                      // 深度写关，测试保留
+		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Stencil: TSR标记
+		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,
+		0x08, 0x08
+	>::GetRHI();
+	// OIT混合: 三个RT全部加法
+	GraphicsPSOInit.BlendState = TStaticBlendState<
+		// RT0 (ColorWeight): 纯加法 src + dst
+		CW_RGBA, BO_Add, BF_One, BF_One, BO_Add, BF_One, BF_One,
+		// RT1 (LogTransmit): 纯加法 src + dst
+		CW_RGBA, BO_Add, BF_One, BF_One, BO_Add, BF_One, BF_One,
+		// RT2 (Velocity): 替换
+		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
+	>::GetRHI();
+	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+
+	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	FIntRect ViewRect = ViewInfo.ViewRect;
+	RHICmdList.SetViewport(
+		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
+		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
+	);
+
+	// 设置shader参数
+	// OIT模式: SortKeysBuffer是恒等映射 (IdentityKeysBuffer)
+	FGaussianSplatOITVS::FParameters VSParameters;
+	VSParameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferSRV;
+	VSParameters.SortKeysBuffer = GlobalAccumulator->OITIdentityKeysBufferSRV;
+	VSParameters.SplatCount = TotalSplatCount;
+	VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, DebugMode));
+	VSParameters.EnableNanite = 1;
+	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+
+	FGaussianSplatOITPS::FParameters PSParameters;
+	SetVelocityOITPSParameters(PSParameters, View, GlobalAccumulator);
+	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+
+	// 绘制 (无排序: 直接按splat顺序绘制)
+	RHICmdList.SetStreamSource(0, nullptr, 0);
+	RHICmdList.DrawIndexedPrimitive(
+		IndexBuffer, 0, 0, 4, 0, 2, TotalSplatCount
+	);
+}
+
+void FGaussianSplatRenderer::DrawSplatsOITGlobalIndirect(
+	FRHICommandListImmediate& RHICmdList,
+	const FSceneView& View,
+	FGaussianGlobalAccumulator* GlobalAccumulator,
+	FBufferRHIRef IndexBuffer,
+	int32 DebugMode)
+{
+	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawOITGlobalIndirect);
+
+	if (!IndexBuffer.IsValid())
+		return;
+
+	TShaderMapRef<FGaussianSplatOITVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FGaussianSplatOITPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+		return;
+
+	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::SRVGraphics));
+
+	// PSO: 与DrawSplatsOIT一致的OIT混合设置
+	FGraphicsPipelineStateInitializer GraphicsPSOInit;
+	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+
+	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
+		false, CF_DepthNearOrEqual,
+		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,
+		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,
+		0x08, 0x08
+	>::GetRHI();
+	GraphicsPSOInit.BlendState = TStaticBlendState<
+		CW_RGBA, BO_Add, BF_One, BF_One, BO_Add, BF_One, BF_One,     // RT0: 加法
+		CW_RGBA, BO_Add, BF_One, BF_One, BO_Add, BF_One, BF_One,     // RT1: 加法
+		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero    // RT2: 替换
+	>::GetRHI();
+	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+
+	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	FIntRect ViewRect = ViewInfo.ViewRect;
+	RHICmdList.SetViewport(
+		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
+		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
+	);
+
+	FGaussianSplatOITVS::FParameters VSParameters;
+	VSParameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferSRV;
+	VSParameters.SortKeysBuffer = GlobalAccumulator->OITIdentityKeysBufferSRV;
+	VSParameters.SplatCount = GlobalAccumulator->AllocatedCount;
+	VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, DebugMode));
+	VSParameters.EnableNanite = 1;
+	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+
+	FGaussianSplatOITPS::FParameters PSParameters;
+	SetVelocityOITPSParameters(PSParameters, View, GlobalAccumulator);
+	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+
+	// Indirect draw: 实例数由GPU的PrefixSumCS确定
+	RHICmdList.SetStreamSource(0, nullptr, 0);
+	RHICmdList.DrawIndexedPrimitiveIndirect(
+		IndexBuffer,
+		GlobalAccumulator->GlobalDrawIndirectArgsBuffer,
+		0
+	);
+}
+
+void FGaussianSplatRenderer::CompositeOITToSceneColor(
+	FRHICommandListImmediate& RHICmdList,
+	const FSceneView& View,
+	FTextureRHIRef OITColorWeightTexture,
+	FTextureRHIRef OITLogTransmitTexture)
+{
+	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCompositeOIT);
+
+	TShaderMapRef<FGaussianSplatCompositeOITVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FGaussianSplatCompositeOITPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+		return;
+
+	// PSO: 预乘alpha over (与原版Composite一致)
+	FGraphicsPipelineStateInitializer GraphicsPSOInit;
+	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+
+	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+	// src + dst × (1-srcAlpha): 将OIT解算结果合成到SceneColor
+	GraphicsPSOInit.BlendState = TStaticBlendState<
+		CW_RGB, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_Zero
+	>::GetRHI();
+	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+
+	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	FIntRect ViewRect = ViewInfo.ViewRect;
+	RHICmdList.SetViewport(
+		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
+		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
+	);
+
+	// PS参数: 两个OIT累积纹理
+	FGaussianSplatCompositeOITPS::FParameters PSParameters;
+	PSParameters.OITColorWeightTexture = OITColorWeightTexture;
+	PSParameters.OITLogTransmitTexture = OITLogTransmitTexture;
+	PSParameters.OITSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+
+	// 全屏三角形
 	RHICmdList.SetStreamSource(0, nullptr, 0);
 	RHICmdList.DrawPrimitive(0, 1, 1);
 }

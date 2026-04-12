@@ -280,6 +280,95 @@ public:
 		int32 DebugMode
 	);
 
+	//----------------------------------------------------------------------
+	// OIT渲染路径 (Mobile-GS加权平均OIT)
+	//----------------------------------------------------------------------
+
+	/**
+	 * 分发MLP前向推理CS (占位符)
+	 * 为每个splat计算phi和opacity，写入PhiOpacityBuffer
+	 */
+	static void DispatchMLPForward(
+		FRHICommandListImmediate& RHICmdList,
+		FGaussianSplatGPUResources* GPUResources,
+		const FVector3f& CameraPosition,
+		int32 SplatCount,
+		float OpacityScale,
+		FBufferRHIRef PhiOpacityBuffer
+	);
+
+	/**
+	 * OIT变体的CalcViewData: 额外读取PhiOpacityBuffer
+	 * 计算OIT权重并写入ViewData.OITWeight
+	 */
+	static void DispatchCalcViewDataOIT(
+		FRHICommandListImmediate& RHICmdList,
+		const FSceneView& View,
+		FGaussianSplatGPUResources* GPUResources,
+		const FMatrix& LocalToWorld,
+		int32 SplatCount,
+		int32 SHOrder,
+		float OpacityScale,
+		float SplatScale,
+		bool bUseLODRendering,
+		uint32 GlobalBaseOffset,
+		FGaussianGlobalAccumulator* GlobalAccumulator,
+		FShaderResourceViewRHIRef PhiOpacityBufferSRV
+	);
+
+	/**
+	 * OIT变体的CalcViewData (紧凑模式)
+	 */
+	static void DispatchCalcViewDataOITCompactedGlobal(
+		FRHICommandListImmediate& RHICmdList,
+		const FSceneView& View,
+		FGaussianSplatGPUResources* GPUResources,
+		const FMatrix& LocalToWorld,
+		int32 SplatCount,
+		int32 OriginalSplatCount,
+		int32 SHOrder,
+		float OpacityScale,
+		float SplatScale,
+		int32 ProxyIndex,
+		FGaussianGlobalAccumulator* GlobalAccumulator,
+		uint32 MaxRenderBudget,
+		FShaderResourceViewRHIRef PhiOpacityBufferSRV
+	);
+
+	/**
+	 * OIT变体的DrawSplats: 使用加法混合输出加权累积量
+	 * 写入 RT0(ColorWeight) + RT1(LogTransmit) + RT2(Velocity)
+	 */
+	static void DrawSplatsOIT(
+		FRHICommandListImmediate& RHICmdList,
+		const FSceneView& View,
+		FGaussianGlobalAccumulator* GlobalAccumulator,
+		FBufferRHIRef IndexBuffer,
+		int32 TotalSplatCount,
+		int32 DebugMode
+	);
+
+	/**
+	 * OIT变体的DrawSplats (Indirect模式)
+	 */
+	static void DrawSplatsOITGlobalIndirect(
+		FRHICommandListImmediate& RHICmdList,
+		const FSceneView& View,
+		FGaussianGlobalAccumulator* GlobalAccumulator,
+		FBufferRHIRef IndexBuffer,
+		int32 DebugMode
+	);
+
+	/**
+	 * OIT合成: 解算加权平均并合成到SceneColor
+	 */
+	static void CompositeOITToSceneColor(
+		FRHICommandListImmediate& RHICmdList,
+		const FSceneView& View,
+		FTextureRHIRef OITColorWeightTexture,
+		FTextureRHIRef OITLogTransmitTexture
+	);
+
 	/**
 	 * Composite the intermediate sRGB-blended splat texture onto SceneColor.
 	 * Converts from sRGB to linear color space during compositing.
