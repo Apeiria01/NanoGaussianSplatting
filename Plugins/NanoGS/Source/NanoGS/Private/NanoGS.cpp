@@ -674,7 +674,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 									FVector3f(SceneView->ViewLocation),
 									SplatCount,
 									Info.Proxy->GetOpacityScale(),
-									PhiOpacityBuffer);
+									PhiOpacityBuffer,
+									Info.Proxy->GetEnableMLPWeights());
 
 								FShaderResourceViewRHIRef PhiSRV = RHICmdList.CreateShaderResourceView(
 									PhiOpacityBuffer, FRHIViewDesc::CreateBufferSRV()
@@ -806,7 +807,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 									FVector3f(SceneView->ViewLocation),
 									ProxySplatCount,
 									Info.Proxy->GetOpacityScale(),
-									PhiOpacityBuffer);
+									PhiOpacityBuffer,
+									Info.Proxy->GetEnableMLPWeights());
 
 								FShaderResourceViewRHIRef PhiSRV = RHICmdList.CreateShaderResourceView(
 									PhiOpacityBuffer, FRHIViewDesc::CreateBufferSRV()

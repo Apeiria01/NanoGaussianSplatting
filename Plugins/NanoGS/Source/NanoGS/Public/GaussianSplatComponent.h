@@ -77,6 +77,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splatting|Performance")
 	bool bEnableFrustumCulling = true;
 
+	/** 启用MLP权重推理 (需要Asset中设置MLPWeightsDirectory)
+	 *  关闭时使用占位符默认值 (phi=1.0, opacity=静态值), 便于A/B对比 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splatting|OIT")
+	bool bEnableMLPWeights = true;
+
 	/** Projected error threshold for LOD selection (resolution-independent, like Nanite).
 	 *  Lower values = more conservative (keep detail longer, less LOD savings)
 	 *  Higher values = more aggressive (switch to LOD sooner, better performance)

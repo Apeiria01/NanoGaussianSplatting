@@ -137,6 +137,20 @@ public:
 	EGaussianPositionFormat PositionFormat = EGaussianPositionFormat::Float32;
 
 	//----------------------------------------------------------------------
+	// OIT MLP权重 (从 mlp_weights.bin 加载)
+	//----------------------------------------------------------------------
+
+	/** MLP权重StructuredBuffer<float> — 全部层权重拼接 */
+	FBufferRHIRef MLPWeightsBuffer;
+	FShaderResourceViewRHIRef MLPWeightsBufferSRV;
+
+	/** MLP第一层输入维度 (SH degree 3时为58) */
+	uint32 MLPInputDim = 0;
+
+	/** 权重是否已成功加载 */
+	bool bHasMLPWeights = false;
+
+	//----------------------------------------------------------------------
 	// Cluster culling resources (Nanite-style optimization)
 	//----------------------------------------------------------------------
 
@@ -329,6 +343,10 @@ private:
 	int32 SHBands = 0;  // Number of SH bands stored in SHBuffer (0 = no SH data)
 	bool bInitialized = false;
 
+	/** CPU端暂存的MLP权重数据 (Initialize中从磁盘加载, InitRHI中上传到GPU后清空) */
+	TArray<float> PendingMLPWeightData;
+	uint32 PendingMLPInputDim = 0;
+
 public:
 	/** Cached state for camera-static sort skipping */
 	FMatrix CachedViewProjectionMatrix = FMatrix::Identity;
@@ -382,6 +400,7 @@ public:
 	float GetOpacityScale() const { return OpacityScale; }
 	float GetSplatScale() const { return SplatScale; }
 	float GetLODErrorThreshold() const { return LODErrorThreshold; }
+	bool GetEnableMLPWeights() const { return bEnableMLPWeights; }
 
 	/** Check if this proxy is safe to use for rendering.
 	 *  Returns false if proxy is being destroyed or has invalid resources.
@@ -425,6 +444,7 @@ private:
 	float SplatScale = 1.0f;
 	float LODErrorThreshold = 0.03f;
 	bool bEnableFrustumCulling = true;
+	bool bEnableMLPWeights = true;
 
 #if WITH_EDITOR
 	/** Cached hit proxy created in CreateHitProxies, used for editor viewport click selection. */

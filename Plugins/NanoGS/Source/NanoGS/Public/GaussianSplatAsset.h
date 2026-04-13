@@ -173,6 +173,14 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "Import")
 	FString SourceFilePath;
 
+	/**
+	 * OIT MLP权重目录路径 (包含 mlp_weights.bin)
+	 * 由 export_mlp_weights.py 从 opacity_phi_nn.pt 导出
+	 * 留空则使用占位符默认值 (phi=1.0, opacity=静态值)
+	 */
+	UPROPERTY(EditAnywhere, Category = "OIT|MLP", meta = (ContentDir))
+	FDirectoryPath MLPWeightsDirectory;
+
 	/** Quality level used during import */
 	UPROPERTY(VisibleAnywhere, Category = "Import")
 	EGaussianQualityLevel ImportQuality = EGaussianQualityLevel::Medium;

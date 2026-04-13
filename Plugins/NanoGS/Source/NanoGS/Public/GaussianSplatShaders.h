@@ -242,11 +242,17 @@ class FMLPForwardCS : public FGlobalShader
 		SHADER_PARAMETER_SRV(ByteAddressBuffer, ScaleBuffer)
 		SHADER_PARAMETER_SRV(ByteAddressBuffer, RotationBuffer)
 		SHADER_PARAMETER_SRV(ByteAddressBuffer, ColorOpacityBuffer)
+		SHADER_PARAMETER_SRV(ByteAddressBuffer, SHBuffer)
+		SHADER_PARAMETER_SRV(StructuredBuffer<float>, MLPWeightsBuffer)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float2>, PhiOpacityBuffer) // 输出: [phi, opacity]
 		SHADER_PARAMETER(FVector3f, CameraPosition)
 		SHADER_PARAMETER(uint32, SplatCount)
 		SHADER_PARAMETER(float, OpacityScale)
+		SHADER_PARAMETER(uint32, MLPInputDim)   // MLP第一层输入维度 (0=使用占位符)
+		SHADER_PARAMETER(uint32, SHCoeffCount)  // 每通道SH系数数 = (bands+1)^2
 	END_SHADER_PARAMETER_STRUCT()
+
+	static constexpr uint32 BatchSize = 16;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -257,6 +263,7 @@ class FMLPForwardCS : public FGlobalShader
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 256);
+		OutEnvironment.SetDefine(TEXT("MLP_BATCH_SIZE"), BatchSize);
 	}
 };
 

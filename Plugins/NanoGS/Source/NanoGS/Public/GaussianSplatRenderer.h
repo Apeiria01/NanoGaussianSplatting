@@ -294,7 +294,8 @@ public:
 		const FVector3f& CameraPosition,
 		int32 SplatCount,
 		float OpacityScale,
-		FBufferRHIRef PhiOpacityBuffer
+		FBufferRHIRef PhiOpacityBuffer,
+		bool bEnableMLPWeights = true
 	);
 
 	/**

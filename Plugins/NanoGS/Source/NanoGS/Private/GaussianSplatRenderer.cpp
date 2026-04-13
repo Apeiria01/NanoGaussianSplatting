@@ -2108,7 +2108,8 @@ void FGaussianSplatRenderer::DispatchMLPForward(
 	const FVector3f& CameraPosition,
 	int32 SplatCount,
 	float OpacityScale,
-	FBufferRHIRef PhiOpacityBuffer)
+	FBufferRHIRef PhiOpacityBuffer,
+	bool bEnableMLPWeights)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, MLPForwardCS);
 
@@ -2124,6 +2125,11 @@ void FGaussianSplatRenderer::DispatchMLPForward(
 	Parameters.ScaleBuffer = GPUResources->ScaleBufferSRV;
 	Parameters.RotationBuffer = GPUResources->RotationBufferSRV;
 	Parameters.ColorOpacityBuffer = GPUResources->ColorOpacityBufferSRV;
+	// SHBuffer可能为空 (SHBands==0), 此时MLPInputDim==0走占位符路径不读SH
+	Parameters.SHBuffer = GPUResources->SHBufferSRV.IsValid()
+		? GPUResources->SHBufferSRV : GPUResources->PositionBufferSRV;
+	const bool bUseWeights = bEnableMLPWeights && GPUResources->bHasMLPWeights;
+	Parameters.MLPWeightsBuffer = GPUResources->MLPWeightsBufferSRV;  // 始终有效 (无权重时为dummy)
 	Parameters.PhiOpacityBuffer = RHICmdList.CreateUnorderedAccessView(
 		PhiOpacityBuffer, FRHIViewDesc::CreateBufferUAV()
 			.SetType(FRHIViewDesc::EBufferType::Structured)
@@ -2131,8 +2137,12 @@ void FGaussianSplatRenderer::DispatchMLPForward(
 	Parameters.CameraPosition = CameraPosition;
 	Parameters.SplatCount = SplatCount;
 	Parameters.OpacityScale = OpacityScale;
+	Parameters.MLPInputDim = bUseWeights ? GPUResources->MLPInputDim : 0;
+	const int32 Bands = GPUResources->GetSHBands();
+	Parameters.SHCoeffCount = (Bands + 1) * (Bands + 1);
 
-	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)SplatCount, 256u);
+	// 批量模式: 每个threadgroup(256线程)协作处理BatchSize个splat
+	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)SplatCount, FMLPForwardCS::BatchSize);
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
 	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
 	RHICmdList.DispatchComputeShader(NumGroups, 1, 1);

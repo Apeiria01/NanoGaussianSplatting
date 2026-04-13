@@ -13,6 +13,8 @@
 #include "DynamicMeshBuilder.h"
 #include "Materials/Material.h"
 #include "EngineUtils.h"
+#include "Misc/FileHelper.h"
+#include "HAL/PlatformFileManager.h"
 
 //////////////////////////////////////////////////////////////////////////
 // FGaussianSplatGPUResources
@@ -49,6 +51,55 @@ void FGaussianSplatGPUResources::Initialize(UGaussianSplatAsset* Asset)
 	LeafClusterCount = SharedData->LeafClusterCount;
 	LODSplatCount = SharedData->LODSplatCount;
 	bHasLODSplats = SharedData->bHasLODSplats;
+
+	// --- 从磁盘加载MLP权重 (game thread, 暂存到PendingMLPWeightData) ---
+	{
+		FString WeightsDir = Asset->MLPWeightsDirectory.Path;
+		if (!WeightsDir.IsEmpty())
+		{
+			FString BinPath = FPaths::Combine(WeightsDir, TEXT("mlp_weights.bin"));
+			// 尝试绝对路径
+			IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+			if (PlatformFile.FileExists(*BinPath))
+			{
+				TArray<uint8> RawBytes;
+				if (FFileHelper::LoadFileToArray(RawBytes, *BinPath))
+				{
+					// 头部: uint32 input_dim, uint32 total_floats (8 bytes)
+					if (RawBytes.Num() >= 8)
+					{
+						const uint32* Header = reinterpret_cast<const uint32*>(RawBytes.GetData());
+						uint32 InputDim = Header[0];
+						uint32 TotalFloats = Header[1];
+						uint32 ExpectedSize = 8 + TotalFloats * sizeof(float);
+
+						if ((uint32)RawBytes.Num() == ExpectedSize && InputDim > 0 && TotalFloats > 0)
+						{
+							PendingMLPInputDim = InputDim;
+							PendingMLPWeightData.SetNumUninitialized(TotalFloats);
+							FMemory::Memcpy(PendingMLPWeightData.GetData(),
+								RawBytes.GetData() + 8, TotalFloats * sizeof(float));
+							UE_LOG(LogTemp, Log, TEXT("MLP权重加载成功: input_dim=%u, total_floats=%u, file=%s"),
+								InputDim, TotalFloats, *BinPath);
+						}
+						else
+						{
+							UE_LOG(LogTemp, Warning, TEXT("MLP权重文件大小不匹配: expected=%u, actual=%d, file=%s"),
+								ExpectedSize, RawBytes.Num(), *BinPath);
+						}
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("MLP权重文件读取失败: %s"), *BinPath);
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("MLP权重文件不存在: %s"), *BinPath);
+			}
+		}
+	}
 
 	// Initialize render resource
 	if (!bInitialized)
@@ -95,6 +146,51 @@ void FGaussianSplatGPUResources::InitRHI(FRHICommandListBase& RHICmdList)
 
 	// Create per-instance buffers (cluster visibility, compaction, sort args, etc.)
 	CreatePerInstanceBuffers(RHICmdList);
+
+	// --- MLP权重上传到GPU (无权重时创建1-float dummy, 避免null SRV) ---
+	{
+		uint32 NumFloats;
+		FRHIResourceCreateInfo CreateInfo(TEXT("MLPWeightsBuffer"));
+
+		if (PendingMLPWeightData.Num() > 0)
+		{
+			NumFloats = (uint32)PendingMLPWeightData.Num();
+			TResourceArray<float>* WeightResourceData = new TResourceArray<float>();
+			WeightResourceData->SetNumUninitialized(NumFloats);
+			FMemory::Memcpy(WeightResourceData->GetData(), PendingMLPWeightData.GetData(), NumFloats * sizeof(float));
+			CreateInfo.ResourceArray = WeightResourceData;
+
+			MLPInputDim = PendingMLPInputDim;
+			bHasMLPWeights = true;
+			PendingMLPWeightData.Empty();
+
+			UE_LOG(LogTemp, Log, TEXT("MLP权重GPU Buffer创建成功: %u floats (%.1f KB), input_dim=%u"),
+				NumFloats, NumFloats * sizeof(float) / 1024.0f, MLPInputDim);
+		}
+		else
+		{
+			// Dummy buffer: 1 float, shader永远不会读取 (MLPInputDim==0走占位符路径)
+			NumFloats = 1;
+			TResourceArray<float>* DummyData = new TResourceArray<float>();
+			DummyData->SetNumZeroed(1);
+			CreateInfo.ResourceArray = DummyData;
+
+			MLPInputDim = 0;
+			bHasMLPWeights = false;
+		}
+
+		MLPWeightsBuffer = RHICmdList.CreateBuffer(
+			NumFloats * sizeof(float),
+			BUF_Static | BUF_ShaderResource | BUF_StructuredBuffer,
+			sizeof(float),
+			ERHIAccess::SRVCompute,
+			CreateInfo);
+
+		MLPWeightsBufferSRV = RHICmdList.CreateShaderResourceView(
+			MLPWeightsBuffer, FRHIViewDesc::CreateBufferSRV()
+				.SetType(FRHIViewDesc::EBufferType::Structured)
+				.SetStride(sizeof(float)));
+	}
 
 	int32 PerInstanceBufferCount = 0;
 	if (bSupportsCompaction) PerInstanceBufferCount += 15; // cluster/compaction/sort buffers
@@ -206,6 +302,11 @@ void FGaussianSplatGPUResources::ReleaseRHI()
 	VisibleSplatCountBufferSRV.SafeRelease();
 	IndirectDispatchArgsBuffer.SafeRelease();
 	IndirectDispatchArgsBufferUAV.SafeRelease();
+
+	// Release MLP权重buffer
+	MLPWeightsBuffer.SafeRelease();
+	MLPWeightsBufferSRV.SafeRelease();
+	bHasMLPWeights = false;
 
 	// Release shared data reference
 	SharedData.Reset();
@@ -693,6 +794,7 @@ FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent
 	, SplatScale(InComponent->SplatScale)
 	, LODErrorThreshold(InComponent->LODErrorThreshold)
 	, bEnableFrustumCulling(InComponent->bEnableFrustumCulling)
+	, bEnableMLPWeights(InComponent->bEnableMLPWeights)
 {
 	bWillEverBeLit = false;
 }
