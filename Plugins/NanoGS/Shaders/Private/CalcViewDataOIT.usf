@@ -181,7 +181,13 @@ void ProcessSplatOIT(uint splatIndex, uint outputIndex, uint selectedClusterID, 
 	float d = length(worldPos.xyz - CameraPosition);       // 相机到高斯的欧氏距离
 	float s_max = max(scale.x, max(scale.y, scale.z));     // 最大scale分量
 	// Mobile-GS论文 Eq.(3): w = φ² + φ/d² + exp(smax/d)
+	
+	
+	//适配PLY空间的尺度和距离 (单位cm → m)
 	float oitWeight = phi * phi + phi / (d * d + 1e-6) + exp(s_max / (d + 1e-6));
+    float d_ply = length(worldPos.xyz - CameraPosition) * 0.01;
+    float smax_ply = max(scale.x, max(scale.y, scale.z)) * 0.01;
+    oitWeight = phi * phi + phi / (d_ply * d_ply + 1e-6) + exp(smax_ply / (d_ply + 1e-6));
 
 	// ===== 写入ViewData =====
 	FGaussianSplatViewData viewData;

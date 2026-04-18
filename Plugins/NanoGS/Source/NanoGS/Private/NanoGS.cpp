@@ -110,6 +110,19 @@ TAutoConsoleVariable<float> CVarCudaRasterizerDebugExposure(
 	TEXT("Linear exposure multiplier applied to the CUDA rasterizer debug overlay."),
 	ECVF_RenderThreadSafe);
 
+/** Pre-MLP 裁剪: 用 ClusterCullingCS 已经产出的可见性位图把不可见 splat 的 MLP 工作跳掉.
+ *  MLP 是 per-splat 全连接网络, 全量推理会遍历所有 splat (无论是否可见).
+ *  打开此开关后, 不可见 splat 直接写 phi=0/opacity=0, 并在整组都被剔除时跳过
+ *  Phase 1~4 的协作矩阵乘. 要求 proxy 有 cluster 数据 (Nanite-enabled asset). */
+TAutoConsoleVariable<int32> CVarMLPCulling(
+	TEXT("gs.MLPCulling"),
+	1,
+	TEXT("Skip MLP forward work for cluster-culled splats.\n")
+	TEXT(" 0: Run full MLP inference on all splats (original behavior)\n")
+	TEXT(" 1: Use ClusterVisibilityBitmap/LODClusterSelectedBitmap to skip invisible splats (default)\n")
+	TEXT("Requires the proxy to have cluster data; otherwise automatically falls back to full inference."),
+	ECVF_RenderThreadSafe);
+
 // Export for other modules
 int32 GGaussianSplatShowClusterBounds = 0;
 
@@ -280,28 +293,40 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
 	// to produce correct colors. After compositing, we convert sRGB→linear for SceneColor.
+	//
+	// RT format: FP32 RGBA. 非-OIT 路径做标准 over-blend, 累积值天然收敛在 [0,1], fp16
+	// 精度理论上够, 但改 fp32 以:
+	//   (a) 与 OIT 路径保持一致的数值精度基准, 便于两路对照调试;
+	//   (b) 避免中低暗部 (< 2^-14) 在 fp16 下触发非规格化数导致的量化台阶.
+	// 代价是每像素 8→16 字节带宽, 桌面 GPU 上 blend-on-RGBA32F 原生支持.
 	FRDGTextureDesc IntermediateDesc = FRDGTextureDesc::Create2D(
 		ColorTexture->Desc.Extent,
-		PF_FloatRGBA,  // Need alpha channel for accumulation tracking
+		PF_A32B32G32R32F,
 		FClearValueBinding(FLinearColor::Transparent),
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
 	FRDGTexture* IntermediateTexture = GraphBuilder.CreateTexture(IntermediateDesc, TEXT("GaussianSplatIntermediateRT"));
 
 	// OIT累积纹理 (仅OIT模式使用)
+	//
+	// OIT 权重 w = φ² + φ/d² + exp(s_max/d), φ 可达 ~1000, 单 splat 的 aw=α·w 就
+	// 会轻易越过 fp16 上限 65504, 多splat 加法累积后更会进入 Kahan 吞噬区
+	// (dst≫src 时 src 被舍入为 0), 使实际存到 RT 的不再是真正的加权平均.
+	// 必须用 fp32 RT 才能保证公式 C_fg = Σ(c·α·w)/Σ(α·w) 在高权重区依然成立.
 	FRDGTexture* OITColorWeightTexture = nullptr;
 	FRDGTexture* OITLogTransmitTexture = nullptr;
 	if (bUseOIT)
 	{
-		// OIT ColorWeight: RGB = Σ(c×α×w), A = Σ(α×w)
+		// OIT ColorWeight: RGB = Σ(c×α×w), A = Σ(α×w)  —— fp32 防溢出 & 防精度塌陷
 		FRDGTextureDesc OITCWDesc = FRDGTextureDesc::Create2D(
-			RenderExtent, PF_FloatRGBA,
+			RenderExtent, PF_A32B32G32R32F,
 			FClearValueBinding(FLinearColor::Transparent),
 			TexCreate_RenderTargetable | TexCreate_ShaderResource);
 		OITColorWeightTexture = GraphBuilder.CreateTexture(OITCWDesc, TEXT("OIT_ColorWeight"));
 
-		// OIT LogTransmit: R = Σlog(1-α)
+		// OIT LogTransmit: R = Σlog(1-α)  —— α 接近 1 时 log(1-α) 可至 -13.8,
+		// 大量 splat 累积后总和可超过 -1e4 量级, fp16 会在中段就卡死. 改 fp32.
 		FRDGTextureDesc OITLTDesc = FRDGTextureDesc::Create2D(
-			RenderExtent, PF_R16F,
+			RenderExtent, PF_R32_FLOAT,
 			FClearValueBinding(FLinearColor::Transparent),
 			TexCreate_RenderTargetable | TexCreate_ShaderResource);
 		OITLogTransmitTexture = GraphBuilder.CreateTexture(OITLTDesc, TEXT("OIT_LogTransmit"));
@@ -669,13 +694,20 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 									.SetInitialState(ERHIAccess::UAVCompute);
 								FBufferRHIRef PhiOpacityBuffer = RHICmdList.CreateBuffer(PhiDesc);
 
+								// MLP 裁剪: 紧凑路径下 cluster 可见性位图已在 ClusterCullingCS 填好,
+								// 可以复用这份数据跳过不可见 splat 的 MLP 推理; proxy 没 cluster
+								// 数据时 DispatchMLPForward 内部会自动退化回全量推理.
+								const bool bMLPCullingCompacted =
+									(CVarMLPCulling.GetValueOnRenderThread() != 0) && GPUResources->bHasClusterData;
 								FGaussianSplatRenderer::DispatchMLPForward(
 									RHICmdList, GPUResources,
+									Info.LocalToWorld,
 									FVector3f(SceneView->ViewLocation),
 									SplatCount,
 									Info.Proxy->GetOpacityScale(),
 									PhiOpacityBuffer,
-									Info.Proxy->GetEnableMLPWeights());
+									Info.Proxy->GetEnableMLPWeights(),
+									bMLPCullingCompacted);
 
 								FShaderResourceViewRHIRef PhiSRV = RHICmdList.CreateShaderResourceView(
 									PhiOpacityBuffer, FRHIViewDesc::CreateBufferSRV()
@@ -802,13 +834,20 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 									.SetInitialState(ERHIAccess::UAVCompute);
 								FBufferRHIRef PhiOpacityBuffer = RHICmdList.CreateBuffer(PhiDesc);
 
+								// MLP 裁剪: fallback 路径 (无紧凑) 下 ClusterCullingCS 同样已经填好
+								// 可见性位图 — 只是下游没有 compacted index 列表, 但 MLP 不依赖
+								// compaction, 可以独立启用 cluster 可见性门控.
+								const bool bMLPCullingFallback =
+									(CVarMLPCulling.GetValueOnRenderThread() != 0) && GPUResources->bHasClusterData;
 								FGaussianSplatRenderer::DispatchMLPForward(
 									RHICmdList, GPUResources,
+									Info.LocalToWorld,
 									FVector3f(SceneView->ViewLocation),
 									ProxySplatCount,
 									Info.Proxy->GetOpacityScale(),
 									PhiOpacityBuffer,
-									Info.Proxy->GetEnableMLPWeights());
+									Info.Proxy->GetEnableMLPWeights(),
+									bMLPCullingFallback);
 
 								FShaderResourceViewRHIRef PhiSRV = RHICmdList.CreateShaderResourceView(
 									PhiOpacityBuffer, FRHIViewDesc::CreateBufferSRV()
@@ -951,91 +990,91 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		}
 		else
 		{
-		// 原始sRGB合成 + CUDA debug overlay
-		// RDG屏障追踪: IntermediateTexture从RTV→SRV
-		FGaussianCompositePassParameters* Pass2Parameters = GraphBuilder.AllocParameters<FGaussianCompositePassParameters>();
-		Pass2Parameters->IntermediateTexture = IntermediateTexture;
-		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
+			// 原始sRGB合成 + CUDA debug overlay
+			// RDG屏障追踪: IntermediateTexture从RTV→SRV
+			FGaussianCompositePassParameters* Pass2Parameters = GraphBuilder.AllocParameters<FGaussianCompositePassParameters>();
+			Pass2Parameters->IntermediateTexture = IntermediateTexture;
+			Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
 
-		// CUDA rasterizer debug overlay settings, evaluated once at build time and
-		// captured by Pass2's execution lambda. Only active when the bridge itself
-		// is enabled — otherwise CudaOutColorBufferSRV will never be populated.
-		const int32 CudaDebugMode = CVarShowCudaRasterizerDebug.GetValueOnRenderThread();
-		const float CudaDebugExposure = CVarCudaRasterizerDebugExposure.GetValueOnRenderThread();
-		const bool bCudaDebugEnabled = bUseCudaRasterizerBridge && CudaDebugMode > 0 && Proxies.Num() > 0;
+			// CUDA rasterizer debug overlay settings, evaluated once at build time and
+			// captured by Pass2's execution lambda. Only active when the bridge itself
+			// is enabled — otherwise CudaOutColorBufferSRV will never be populated.
+			const int32 CudaDebugMode = CVarShowCudaRasterizerDebug.GetValueOnRenderThread();
+			const float CudaDebugExposure = CVarCudaRasterizerDebugExposure.GetValueOnRenderThread();
+			const bool bCudaDebugEnabled = bUseCudaRasterizerBridge && CudaDebugMode > 0 && Proxies.Num() > 0;
 
-		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
-			Pass2Parameters,
-			ERDGPassFlags::Raster,
-			[SceneView, IntermediateTexture, Proxies, RenderExtent, CudaDebugMode, CudaDebugExposure, bCudaDebugEnabled]
-			(FRHICommandListImmediate& RHICmdList)
-			{
-				if (!SceneView) return;
-
-				FRHITexture* IntermediateRHI = IntermediateTexture->GetRHI();
-				if (!IntermediateRHI) return;
-
-				FGaussianSplatRenderer::CompositeToSceneColor(
-					RHICmdList, *SceneView, IntermediateRHI);
-
-				if (!bCudaDebugEnabled)
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
+				Pass2Parameters,
+				ERDGPassFlags::Raster,
+				[SceneView, IntermediateTexture, Proxies, RenderExtent, CudaDebugMode, CudaDebugExposure, bCudaDebugEnabled]
+				(FRHICommandListImmediate& RHICmdList)
 				{
-					return;
-				}
+					if (!SceneView) return;
 
-				// Find the first valid proxy that has a populated CUDA output SRV.
-				// Pass1 only runs forward() on ValidProxies[0], so normally only
-				// the closest proxy has a live SRV — scan defensively in case the
-				// proxy set changed between Pass1 and Pass2 execution.
-				FGaussianSplatRenderData* DebugRenderData = nullptr;
-				for (FGaussianSplatSceneProxy* Proxy : Proxies)
-				{
-					if (!Proxy || !Proxy->IsValidForRendering()) continue;
-					FGaussianSplatGPUResources* GPUResources = Proxy->GetGPUResources();
-					if (!GPUResources) continue;
-					FGaussianSplatRenderData* SharedRenderData = GPUResources->GetSharedRenderData();
-					if (SharedRenderData && SharedRenderData->CudaOutColorBufferSRV.IsValid()
-						&& SharedRenderData->CudaOutColorBufferWidth > 0
-						&& SharedRenderData->CudaOutColorBufferHeight > 0)
+					FRHITexture* IntermediateRHI = IntermediateTexture->GetRHI();
+					if (!IntermediateRHI) return;
+
+					FGaussianSplatRenderer::CompositeToSceneColor(
+						RHICmdList, *SceneView, IntermediateRHI);
+
+					if (!bCudaDebugEnabled)
 					{
-						DebugRenderData = SharedRenderData;
-						break;
+						return;
 					}
-				}
-				if (!DebugRenderData) return;
 
-				// DestRect in viewport-space pixels (absolute). The PS uses these to
-				// decide per-pixel whether to sample the CUDA buffer or discard.
-				FVector4f DestRect;
-				if (CudaDebugMode >= 2)
-				{
-					// Full-screen replace
-					DestRect = FVector4f(0.0f, 0.0f,
-						static_cast<float>(RenderExtent.X),
-						static_cast<float>(RenderExtent.Y));
-				}
-				else
-				{
-					// Bottom-right quadrant, half width/half height
-					const float HalfW = static_cast<float>(RenderExtent.X) * 0.5f;
-					const float HalfH = static_cast<float>(RenderExtent.Y) * 0.5f;
-					DestRect = FVector4f(
-						static_cast<float>(RenderExtent.X) - HalfW,
-						static_cast<float>(RenderExtent.Y) - HalfH,
-						static_cast<float>(RenderExtent.X),
-						static_cast<float>(RenderExtent.Y));
-				}
+					// Find the first valid proxy that has a populated CUDA output SRV.
+					// Pass1 only runs forward() on ValidProxies[0], so normally only
+					// the closest proxy has a live SRV — scan defensively in case the
+					// proxy set changed between Pass1 and Pass2 execution.
+					FGaussianSplatRenderData* DebugRenderData = nullptr;
+					for (FGaussianSplatSceneProxy* Proxy : Proxies)
+					{
+						if (!Proxy || !Proxy->IsValidForRendering()) continue;
+						FGaussianSplatGPUResources* GPUResources = Proxy->GetGPUResources();
+						if (!GPUResources) continue;
+						FGaussianSplatRenderData* SharedRenderData = GPUResources->GetSharedRenderData();
+						if (SharedRenderData && SharedRenderData->CudaOutColorBufferSRV.IsValid()
+							&& SharedRenderData->CudaOutColorBufferWidth > 0
+							&& SharedRenderData->CudaOutColorBufferHeight > 0)
+						{
+							DebugRenderData = SharedRenderData;
+							break;
+						}
+					}
+					if (!DebugRenderData) return;
 
-				FGaussianSplatRenderer::BlitCudaOutColorDebug(
-					RHICmdList,
-					*SceneView,
-					DebugRenderData->CudaOutColorBufferSRV,
-					FUintVector2(DebugRenderData->CudaOutColorBufferWidth, DebugRenderData->CudaOutColorBufferHeight),
-					DestRect,
-					CudaDebugExposure);
-			}
-		);
+					// DestRect in viewport-space pixels (absolute). The PS uses these to
+					// decide per-pixel whether to sample the CUDA buffer or discard.
+					FVector4f DestRect;
+					if (CudaDebugMode >= 2)
+					{
+						// Full-screen replace
+						DestRect = FVector4f(0.0f, 0.0f,
+							static_cast<float>(RenderExtent.X),
+							static_cast<float>(RenderExtent.Y));
+					}
+					else
+					{
+						// Bottom-right quadrant, half width/half height
+						const float HalfW = static_cast<float>(RenderExtent.X) * 0.5f;
+						const float HalfH = static_cast<float>(RenderExtent.Y) * 0.5f;
+						DestRect = FVector4f(
+							static_cast<float>(RenderExtent.X) - HalfW,
+							static_cast<float>(RenderExtent.Y) - HalfH,
+							static_cast<float>(RenderExtent.X),
+							static_cast<float>(RenderExtent.Y));
+					}
+
+					FGaussianSplatRenderer::BlitCudaOutColorDebug(
+						RHICmdList,
+						*SceneView,
+						DebugRenderData->CudaOutColorBufferSRV,
+						FUintVector2(DebugRenderData->CudaOutColorBufferWidth, DebugRenderData->CudaOutColorBufferHeight),
+						DestRect,
+						CudaDebugExposure);
+				}
+			);
 		} // !bUseOIT
 }
 

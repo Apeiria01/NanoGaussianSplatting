@@ -18,11 +18,27 @@ ByteAddressBuffer SHBuffer;
 StructuredBuffer<float> MLPWeightsBuffer;
 RWStructuredBuffer<float2> PhiOpacityBuffer;
 
+// ===== Cluster-level visibility (可选, 仅 UseMLPCulling!=0 时读取) =====
+// 来自 ClusterCullingCS 的产物, 与 CompactSplats.usf / CalcViewDataOIT.usf 语义完全一致.
+// UseMLPCulling=0 时, 这四个 buffer 可以是任何有效 SRV (不会被采样).
+StructuredBuffer<uint> SplatClusterIndexBuffer;
+StructuredBuffer<uint> ClusterVisibilityBitmap;
+StructuredBuffer<uint> LODClusterSelectedBitmap;
+StructuredBuffer<uint> SelectedClusterBuffer;
+
 float3 CameraPosition;
 uint SplatCount;
 float OpacityScale;
 uint MLPInputDim;
 uint SHCoeffCount;
+
+// ===== Pre-MLP 裁剪开关 =====
+// 0 = 全量推理 (原行为, 不读任何 cluster buffer)
+// 1 = 按 cluster 可见性/LOD 位图跳过不可见 splat 的全部推理工作
+uint UseMLPCulling;
+uint UseClusterCulling;   // 0 = 无 cluster 数据 (相当于关掉 MLP 裁剪)
+uint UseLODRendering;     // 0 = 不渲染 LOD splat; 1 = 按 LODClusterSelectedBitmap 选中
+uint OriginalSplatCount;  // 原始 splat 数; [0, OriginalSplatCount) 是原 splat, 其后是 LOD splat
 
 #define H1 256
 #define H2 128
@@ -34,10 +50,61 @@ uint SHCoeffCount;
 groupshared float gs_h[BATCH][H1];              // Layer1输出 / Layer3输出复用
 groupshared float gs_buf[BATCH][MAX_SHARED_DIM]; // 输入组装 / Layer2输出复用
 
+// 可见性槽位标记 (仅 UseMLPCulling!=0 时有意义): 0=跳过, 1=做完整推理
+groupshared uint gs_valid[BATCH];
+// 本线程组内有效 splat 数; 若 ==0 则整组提前返回, 省掉 Phase 1~4 的协作矩阵乘
+groupshared uint gs_validCount;
+
+// 与 CompactSplats.usf:44-97 完全对齐的可见性判定.
+// 不可见的 splat: 原始 splat 的叶 cluster 不在视锥内 / 或被父 LOD 吃掉;
+// LOD splat 的父 cluster 没被选中.
+bool IsSplatVisibleForMLP(uint splatIndex)
+{
+    if (UseMLPCulling == 0) return true;     // 全量推理路径
+    if (UseClusterCulling == 0) return true; // 该 proxy 没 cluster 数据 → 不能裁
+
+    uint clusterIndex = SplatClusterIndexBuffer[splatIndex];
+    bool isLODSplat = (splatIndex >= OriginalSplatCount);
+
+    if (isLODSplat)
+    {
+        // LOD splat: 父 cluster 被选中才渲染
+        if (UseLODRendering == 0) return false;
+        uint bitmapIdx = clusterIndex / 32u;
+        uint bitMask   = 1u << (clusterIndex % 32u);
+        return (LODClusterSelectedBitmap[bitmapIdx] & bitMask) != 0u;
+    }
+    else
+    {
+        // 原始 splat: 先看叶 cluster 是否视锥内
+        uint bitmapIdx = clusterIndex / 32u;
+        uint bitMask   = 1u << (clusterIndex % 32u);
+        if ((ClusterVisibilityBitmap[bitmapIdx] & bitMask) == 0u)
+            return false;
+
+        // 再看是否被父 LOD 覆盖 (selectedClusterID != 自己)
+        if (UseLODRendering != 0)
+        {
+            uint packedSelected = SelectedClusterBuffer[clusterIndex];
+            uint selectedClusterID = packedSelected & 0x00FFFFFFu;
+            if (selectedClusterID != clusterIndex)
+                return false; // 交给父 LOD splat 去渲染
+        }
+        return true;
+    }
+}
+
 [numthreads(THREADGROUP_SIZE, 1, 1)]
 void MainCS(uint3 GroupId : SV_GroupID, uint TIdx : SV_GroupIndex)
 {
     uint baseSplat = GroupId.x * BATCH;
+
+    // 重置有效计数
+    if (TIdx == 0)
+        gs_validCount = 0;
+    if (TIdx < BATCH)
+        gs_valid[TIdx] = 0;
+    GroupMemoryBarrierWithGroupSync();
 
     // ===== 占位符路径 =====
     if (MLPInputDim == 0)
@@ -68,11 +135,30 @@ void MainCS(uint3 GroupId : SV_GroupID, uint TIdx : SV_GroupIndex)
     uint offBop = offWop + H3;
 
     // ===== Phase 0: 组装输入 (前BATCH个线程, 每个组装1个splat) =====
+    // 同时做可见性门控: 不可见 splat 直接写 (phi=0, opacity=0) 并把自己的 gs_buf
+    // 清零, 不占 Phase 1~4 的实际计算 (但仍需要参与协作写, 所以 gs_buf 必须是零).
     if (TIdx < BATCH)
     {
         uint si = baseSplat + TIdx;
-        if (si < SplatCount)
+        bool isInRange = (si < SplatCount);
+        bool isVisible = false;
+
+        if (isInRange)
         {
+            isVisible = IsSplatVisibleForMLP(si);
+            if (!isVisible)
+            {
+                // cluster 剔除: 写 phi=0 / opacity=0. 下游 Splatting 用
+                // α = opacity · exp(-phi²·mahal), opacity=0 → α=0 → 无屏幕贡献.
+                PhiOpacityBuffer[si] = float2(0.0, 0.0);
+            }
+        }
+
+        if (isVisible)
+        {
+            gs_valid[TIdx] = 1;
+            InterlockedAdd(gs_validCount, 1);
+
             uint idx = 0;
 
             // SH系数 (fp16 → fp32, L2-normalize)
@@ -92,35 +178,67 @@ void MainCS(uint3 GroupId : SV_GroupID, uint TIdx : SV_GroupIndex)
             for (uint n = 0; n < idx; n++)
                 gs_buf[TIdx][n] *= invN;
 
-            // viewdir
-            float3 pos = asfloat(PositionBuffer.Load3(si * 12));
-            float3 vd = normalize(pos - CameraPosition);
+            // ========================================================
+            // MLP训练样本在 PLY 空间 (X-right, Y-down, Z-forward, 右手系),
+            // 而 PositionBuffer / ScaleBuffer / RotationBuffer 在 PLY 加载
+            // 阶段被 PLYFileReader 转到 UE-local 空间 (X-fwd, Y-right, Z-up,
+            // 左手系, 单位 cm). 这里把这些 per-splat 输入反向变换回 PLY 空间
+            // 再送入 MLP, 与训练输入分布一致.
+            //
+            // PLYFileReader 的转换关系 (见 PLYFileReader.cpp:344-373):
+            //   UE.X =  PLY.Z * 100        |   UE-quat.X = -PLY-quat.Z
+            //   UE.Y =  PLY.X * 100        |   UE-quat.Y = -PLY-quat.X
+            //   UE.Z = -PLY.Y * 100        |   UE-quat.Z =  PLY-quat.Y
+            //                              |   UE-quat.W =  PLY-quat.W
+            //   scale: UE = permute(PLY.zxy) × exp × 100   (无 sign 翻转)
+            //
+            // 反向 (UE → PLY):
+            //   pos_PLY   = (UE.y, -UE.z, UE.x) / 100      (normalize 吸收 /100)
+            //   scale_PLY = (UE.y,  UE.z, UE.x) / 100      (normalize 吸收 /100)
+            //   quat_PLY  = (-UE.y, UE.z, -UE.x, UE.w)
+            //
+            // CameraPosition 已在 C++ 侧转到 PLY 空间, 此处可直接减.
+            // ========================================================
+
+            // viewdir (PLY 空间)
+            float3 pos_ue = asfloat(PositionBuffer.Load3(si * 12));
+            float3 pos_ply = float3(pos_ue.y, -pos_ue.z, pos_ue.x);
+            float3 vd = normalize(pos_ply - CameraPosition);
             gs_buf[TIdx][idx++] = vd.x;
             gs_buf[TIdx][idx++] = vd.y;
             gs_buf[TIdx][idx++] = vd.z;
 
-            // scale (L2-normalize)
-            float3 sc = asfloat(ScaleBuffer.Load3(si * 12));
+            // scale (PLY 空间, L2-normalize)
+            float3 sc_ue = asfloat(ScaleBuffer.Load3(si * 12));
+            float3 sc = float3(sc_ue.y, sc_ue.z, sc_ue.x);
             float scSq = dot(sc, sc);
             sc *= (scSq > 1e-12) ? rsqrt(scSq) : 0.0;
             gs_buf[TIdx][idx++] = sc.x;
             gs_buf[TIdx][idx++] = sc.y;
             gs_buf[TIdx][idx++] = sc.z;
 
-            // rotation
-            float4 rot = asfloat(RotationBuffer.Load4(si * 16));
+            // rotation (PLY 空间的 quat, 训练时 Python 按 (w,x,y,z) 顺序送入 MLP)
+            float4 rot_ue = asfloat(RotationBuffer.Load4(si * 16));
+            float4 rot = float4(-rot_ue.y, rot_ue.z, -rot_ue.x, rot_ue.w); // PLY (x,y,z,w)
+            gs_buf[TIdx][idx++] = rot.w; // ← 关键：先 w
             gs_buf[TIdx][idx++] = rot.x;
             gs_buf[TIdx][idx++] = rot.y;
             gs_buf[TIdx][idx++] = rot.z;
-            gs_buf[TIdx][idx++] = rot.w;
         }
         else
         {
+            // 越界或被剔除: 把 gs_buf 清零, 让 Phase 1~4 的 MAC 仍然合法 (0·w=0)
+            // 避免读到未初始化数据污染相邻 valid splat 的中间结果.
             for (uint i = 0; i < MAX_SHARED_DIM; i++)
                 gs_buf[TIdx][i] = 0.0;
         }
     }
     GroupMemoryBarrierWithGroupSync();
+
+    // 整个 threadgroup 的 BATCH 个 splat 全被剔除 → 跳过 Phase 1~4
+    // (Phase 1~4 每个权重只读一次但会遍历所有 BATCH, 跳过整组能省下 MLP 全部 FMA)
+    if (UseMLPCulling != 0 && gs_validCount == 0)
+        return;
 
     // ===== Phase 1: Layer1 (InputDim → 256) + ReLU =====
     // 256个线程全部参与, 线程TIdx计算输出节点TIdx, 处理所有BATCH个splat
@@ -201,7 +319,14 @@ void MainCS(uint3 GroupId : SV_GroupID, uint TIdx : SV_GroupIndex)
     if (TIdx < BATCH)
     {
         uint si = baseSplat + TIdx;
-        if (si < SplatCount)
+        // 可见性门控: 不可见 splat 的 PhiOpacityBuffer 已在 Phase 0 写过 (0,0),
+        // 这里不能覆盖 — 因为 Phase 1~4 的中间结果对该 slot 是 "0 输入 MLP" 产物,
+        // 不是真实 phi/opacity.
+        // UseMLPCulling=0 时 IsSplatVisibleForMLP 永远返回 true → gs_valid[TIdx]=1,
+        // 走 `gs_valid != 0` 分支也能落地, 这里短路成 UseMLPCulling==0 只是少读 1 次
+        // groupshared, 对编译器友好.
+        bool shouldWrite = (si < SplatCount) && (UseMLPCulling == 0 || gs_valid[TIdx] != 0);
+        if (shouldWrite)
         {
             // Phi: Linear(64→1) + ReLU
             float phi = MLPWeightsBuffer[offBphi];

@@ -285,17 +285,28 @@ public:
 	//----------------------------------------------------------------------
 
 	/**
-	 * 分发MLP前向推理CS (占位符)
+	 * 分发MLP前向推理CS
 	 * 为每个splat计算phi和opacity，写入PhiOpacityBuffer
+	 *
+	 * bUseCulling: 启用 pre-MLP cluster 可见性裁剪.
+	 *   - false (默认): 对所有 SplatCount 个点做完整 MLP 推理 (原行为).
+	 *   - true:  使用 ClusterCullingCS 已经产出的 ClusterVisibilityBitmap /
+	 *            LODClusterSelectedBitmap / SelectedClusterBuffer 来门控每个 splat
+	 *            的 MLP 工作; 不可见的 splat 直接写入 phi=0/opacity=0, 并省掉整个
+	 *            线程组的 Layer1~3 协作矩阵乘 (当整组都不可见时).
+	 *            需要 GPUResources->bHasClusterData 为 true, 否则 shader 内部会
+	 *            fallback 成 "全量推理" (UseClusterCulling=0).
 	 */
 	static void DispatchMLPForward(
 		FRHICommandListImmediate& RHICmdList,
 		FGaussianSplatGPUResources* GPUResources,
-		const FVector3f& CameraPosition,
+		const FMatrix& LocalToWorld,
+		const FVector3f& WorldCameraPosition,
 		int32 SplatCount,
 		float OpacityScale,
 		FBufferRHIRef PhiOpacityBuffer,
-		bool bEnableMLPWeights = true
+		bool bEnableMLPWeights = true,
+		bool bUseCulling = false
 	);
 
 	/**

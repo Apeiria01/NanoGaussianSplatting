@@ -245,11 +245,23 @@ class FMLPForwardCS : public FGlobalShader
 		SHADER_PARAMETER_SRV(ByteAddressBuffer, SHBuffer)
 		SHADER_PARAMETER_SRV(StructuredBuffer<float>, MLPWeightsBuffer)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float2>, PhiOpacityBuffer) // 输出: [phi, opacity]
+		// Cluster 裁剪 SRV: 与 FGaussianSplatCalcViewDataOITCS 完全同款语义.
+		// UseMLPCulling=0 或 UseClusterCulling=0 时这些 SRV 不会被采样, 可传
+		// 任何有效 StructuredBuffer<uint> (比如 PositionBuffer 的 uint 视图).
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SplatClusterIndexBuffer)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, ClusterVisibilityBitmap)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, LODClusterSelectedBitmap)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SelectedClusterBuffer)
 		SHADER_PARAMETER(FVector3f, CameraPosition)
 		SHADER_PARAMETER(uint32, SplatCount)
 		SHADER_PARAMETER(float, OpacityScale)
 		SHADER_PARAMETER(uint32, MLPInputDim)   // MLP第一层输入维度 (0=使用占位符)
 		SHADER_PARAMETER(uint32, SHCoeffCount)  // 每通道SH系数数 = (bands+1)^2
+		// Pre-MLP 裁剪控制
+		SHADER_PARAMETER(uint32, UseMLPCulling)      // 0=全量推理, 1=按 cluster 可见性跳过
+		SHADER_PARAMETER(uint32, UseClusterCulling)  // 0=proxy 没 cluster 数据 (强制关 MLP 裁剪)
+		SHADER_PARAMETER(uint32, UseLODRendering)    // 0=不渲染 LOD splat
+		SHADER_PARAMETER(uint32, OriginalSplatCount) // 原始 splat 数 (LOD splat 起始索引)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static constexpr uint32 BatchSize = 16;

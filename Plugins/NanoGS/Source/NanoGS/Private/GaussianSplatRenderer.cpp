@@ -2105,11 +2105,13 @@ static void SetVelocityOITPSParameters(
 void FGaussianSplatRenderer::DispatchMLPForward(
 	FRHICommandListImmediate& RHICmdList,
 	FGaussianSplatGPUResources* GPUResources,
-	const FVector3f& CameraPosition,
+	const FMatrix& LocalToWorld,
+	const FVector3f& WorldCameraPosition,
 	int32 SplatCount,
 	float OpacityScale,
 	FBufferRHIRef PhiOpacityBuffer,
-	bool bEnableMLPWeights)
+	bool bEnableMLPWeights,
+	bool bUseCulling)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, MLPForwardCS);
 
@@ -2134,7 +2136,37 @@ void FGaussianSplatRenderer::DispatchMLPForward(
 		PhiOpacityBuffer, FRHIViewDesc::CreateBufferUAV()
 			.SetType(FRHIViewDesc::EBufferType::Structured)
 			.SetStride(2 * sizeof(float)));
-	Parameters.CameraPosition = CameraPosition;
+
+	// ===== Cluster 裁剪 SRV 绑定 =====
+	// 和 DispatchCalcViewDataOIT 同样的策略: 即使裁剪关掉, SRV 槽位也必须给一个
+	// 有效的 StructuredBuffer<uint>. bHasClusterData=false 时这些原本就是 dummy.
+	Parameters.SplatClusterIndexBuffer   = GPUResources->SplatClusterIndexBufferSRV;
+	Parameters.ClusterVisibilityBitmap   = GPUResources->ClusterVisibilityBitmapSRV;
+	Parameters.LODClusterSelectedBitmap  = GPUResources->LODClusterSelectedBitmapSRV;
+	Parameters.SelectedClusterBuffer     = GPUResources->SelectedClusterBufferSRV;
+
+	// 只有同时满足 "caller 要求启用" 和 "proxy 真有 cluster 数据" 时才开裁剪;
+	// 否则 shader 内部的 IsSplatVisibleForMLP 会直接返回 true (全量推理).
+	const bool bCanCull = bUseCulling && GPUResources->bHasClusterData;
+	Parameters.UseMLPCulling      = bCanCull ? 1u : 0u;
+	Parameters.UseClusterCulling  = GPUResources->bHasClusterData ? 1u : 0u;
+	// LOD 渲染始终启用 (和 CalcViewDataOIT 的默认一致): 若 proxy 有 cluster 数据,
+	// 则 LOD splat 按 LODClusterSelectedBitmap 判定; 否则就是 0.
+	Parameters.UseLODRendering    = GPUResources->bHasClusterData ? 1u : 0u;
+	Parameters.OriginalSplatCount = GPUResources->bHasClusterData
+		? (uint32)(SplatCount - GPUResources->LODSplatCount)
+		: (uint32)SplatCount;
+
+	// PositionBuffer存的是asset/local空间位置 (PLY坐标转换+m→cm, 无actor变换),
+	// 所以相机先变到local空间, 再进一步转到 PLY 空间 (和 shader 里 pos/scale/rot
+	// 的反向变换保持一致, 令 MLP 看到的 viewdir/特征与训练分布同源).
+	const FVector LocalCamera = LocalToWorld.InverseTransformPosition(FVector(WorldCameraPosition));
+	// UE-local → PLY: (x, y, z) → (y, -z, x) (matches PLYFileReader 反向)
+	const FVector3f PLYCamera(
+		(float)LocalCamera.Y,
+		(float)-LocalCamera.Z,
+		(float)LocalCamera.X);
+	Parameters.CameraPosition = PLYCamera;
 	Parameters.SplatCount = SplatCount;
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.MLPInputDim = bUseWeights ? GPUResources->MLPInputDim : 0;

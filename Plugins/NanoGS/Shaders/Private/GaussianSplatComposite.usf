@@ -8,17 +8,21 @@
 // writes sRGB premultiplied-alpha colors to an intermediate render target.
 // This composite pass un-premultiplies, converts sRGB→linear, re-premultiplies,
 // and blends the result onto SceneColor.
+//
+// Tone 处理: 仅做 sRGB → linear (pow 2.2), 不做 InverseACESTonemap, 不做 saturate.
+// 让 UE Tonemapper 自己对 splat 走一遍 ACES; 过亮的根因是 sRGB/linear 不匹配或
+// 自动曝光, 应该在引擎侧 (禁用 AutoExposure / 固定 ExposureCompensation) 解决,
+// 而不是在这里去反向 ACES.
 
 #include "/Engine/Public/Platform.ush"
 
 Texture2D IntermediateTexture;
 SamplerState IntermediateSampler;
 
-// Attempt to invert UE's ACES filmic tone curve so that display-ready gaussian
-// splat colors survive tone mapping unchanged.  Uses the Narkowicz ACES fit
-// (same curve UE's default tone mapper approximates) and solves the quadratic
-// analytically.  Without this, already-display-ready sRGB colours appear
-// over-saturated after the engine applies its S-curve.
+// [当前未使用] 反向 ACES 色调映射. 原意是让 "已经是 display-ready 的 splat 颜色"
+// 通过 UE Tonemapper 后保持不变. 但在 clamp(color, 0, 0.99) 附近会有指数级放大
+// (color=0.99 时 ~5.55×), 叠加 UE 自动曝光后整体过曝. 现在策略改为只做 sRGB→linear
+// 解码, 由 UE 自己的 ACES 曲线去吃 splat — 保留该函数仅作 A/B 调参参考.
 float3 InverseACESTonemap(float3 color)
 {
 	// Narkowicz ACES fit: y = clamp((x*(a*x+b)) / (x*(c*x+d)+e))
@@ -65,15 +69,13 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 	}
 
 	// Un-premultiply to recover the actual composited sRGB color
+	// (不做 saturate — 溢出 [0,1] 的真实亮度让 UE Tonemapper / 曝光自己收敛)
 	float3 srgbColor = srgbAccum.rgb / srgbAccum.a;
 
-	// Convert sRGB to linear for UE's SceneColor buffer
+	// sRGB → linear: 3DGS 训练/推理产物的颜色数值在 sRGB 域, 但 UE SceneColor 期望
+	// 线性光. 只做这一步解码, 不做 InverseACESTonemap —— 让 UE 自己的 ACES 曲线
+	// 自然地把 splat 吃进去. 加上 Inverse 会让近 1.0 的像素被指数级放大, 曝光失控.
 	float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
-
-	// Apply inverse ACES tone curve so that UE's tone mapper maps us back to
-	// the intended display color.  Without this, the ACES S-curve boosts
-	// saturation and contrast of our already-display-ready splat colours.
-	linearColor = InverseACESTonemap(linearColor);
 
 	// Re-premultiply with accumulated alpha
 	float3 linearPremultiplied = linearColor * srgbAccum.a;

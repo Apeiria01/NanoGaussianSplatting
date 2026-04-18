@@ -9,10 +9,6 @@
 //   C_fg = Σ(c×α×w) / Σ(α×w)         // 加权平均前景色
 //   C_out = C_fg × (1-T) + T × C_bg   // 与背景混合
 //
-// 与GaussianSplatComposite.usf的区别:
-//   1. 读取两个输入纹理而非一个
-//   2. 使用OIT解算公式代替un-premultiply
-//   3. 输出的alpha = (1-T) 表示前景覆盖度
 
 #include "/Engine/Public/Platform.ush"
 
@@ -71,10 +67,15 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 	float3 srgbColor = colorWeight.rgb * invW;       // 加权平均颜色 (sRGB空间)
 	srgbColor = saturate(srgbColor);                 // 夹紧到[0,1]
 
-	float alpha = 1.0 - T;  // 前景覆盖度
-
+	/*float alpha = 1.0 - T;  // 前景覆盖度
+    float3 linearColor = colorWeight.rgb * invW; // 无 saturate / pow / InverseACES
+    return float4(linearColor * alpha, alpha);*/
+    float3 avgSrgb = colorWeight.rgb * invW;
+    float3 linearColor = pow(max(avgSrgb, 0.0), 2.2); // 仅做 sRGB 解码
+    float alpha = 1.0 - T;
+    return float4(linearColor * alpha, alpha);
 	// sRGB → linear
-	float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
+	/*float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
 
 	// 反向ACES色调映射 (确保经过UE色调映射后回到目标颜色)
 	linearColor = InverseACESTonemap(linearColor);
@@ -83,5 +84,5 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 	float3 linearPremultiplied = linearColor * alpha;
 
 	// Blend state: src + dst × (1-srcAlpha) → 背景部分由硬件混合完成
-	return float4(linearPremultiplied, alpha);
+	return float4(linearPremultiplied, alpha);*/
 }
